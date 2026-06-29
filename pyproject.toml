@@ -16,7 +16,8 @@ dependencies = [
     "peft>=0.19.1",
     "mlflow>=3.14.0",
     "scikit-learn>=1.9.0",
-    "tytonai_utils[webmap,s3,model]"
+    "tytonai_utils[webmap,s3,model]",
+    "data_balance"
 ]
 
 [project.optional-dependencies]
@@ -37,6 +38,7 @@ default-groups = ["storage", "pytorch", "test"]
 "dinov3-embedding" = { git = "https://github.com/millcrest/tytonai-python-activities", subdirectory = "dinov3_embedding", branch = "main" }
 "bbox_to_tile_grid" = { git = "https://github.com/millcrest/tytonai-python-activities", subdirectory = "bbox_to_tile_grid", branch = "main" }
 "clip_raster_tile" = { git = "https://github.com/millcrest/tytonai-python-activities", subdirectory = "clip_raster_tile", branch = "main" }
+"data_balance" = { git = "https://github.com/millcrest/tytonai-python-activities", subdirectory = "data_balance", branch = "main" }
 "dinov3" = { git = "https://github.com/facebookresearch/dinov3.git", rev = "31703e4cbf1ccb7c4a72daa1350405f86754b6d1" }
 "tytonai_utils"    = { git = "https://github.com/clement-tyton/tytonai_utils.git" }
 

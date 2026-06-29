@@ -1,0 +1,48 @@
+{
+  "config": {
+    "bands": [
+      "RED",
+      "GREEN",
+      "BLUE"
+    ],
+    "train_std": [
+      34.538010899999996,
+      28.514056649999997,
+      22.719786
+    ],
+    "activation": "softmax2d",
+    "model_type": "Unet",
+    "train_mean": [
+      147.54045255,
+      117.7377228,
+      100.1281164
+    ],
+    "encoder_type": "timm-res2net101_26w_4s",
+    "encoder_depth": 5,
+    "encoder_weights": "imagenet",
+    "preprocess_before_augmentation": false
+  },
+  "class_list": [
+    2,
+    4,
+    5,
+    6,
+    7,
+    40
+  ],
+  "model_name": "Mega Model v5 (6 Class)_e0",
+  "model_bands": [
+    "RED",
+    "GREEN",
+    "BLUE"
+  ],
+  "input_class_list": [
+    2,
+    4,
+    5,
+    6,
+    7,
+    40
+  ],
+  "epoch_file_key": "s3://9b38a3ce-6fd6-11ef-8285-472724185bb4/Projects/MegaModels/MMv5_6_Class/undefinedmodel_epoch_400.v2.pth"
+}

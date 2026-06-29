@@ -1,0 +1,79 @@
+[project]
+name = "unsupervised_learning_DINO"
+version = "0.2.0"
+requires-python = ">=3.14"
+
+dependencies = [
+    "color-operations==0.3.0",
+    "dinov3-embedding",          # the activity, pulled from git (source below)
+    "matplotlib>=3.10.9",
+    "pyarrow>=24.0.0",
+    "tqdm>=4.68.1",
+    "zarr>=3.0.0",               # one chunked patches.zarr per site (replaces per-cell .npz)
+    "bbox_to_tile_grid",
+    "tytonai-core==0.5.3",       # the activity core, now required
+    "tytonai.gis[geom,raster,tiff]==0.5.3",
+    "peft>=0.19.1",
+    "mlflow>=3.14.0",
+    "scikit-learn>=1.9.0",
+    "tytonai_utils[webmap,s3,model]"
+]
+
+[project.optional-dependencies]
+storage = ["google-cloud-storage>=3.0.0"]
+pytorch = ["dinov3", "torch==2.11.0", "torchvision==0.26.0"]
+test = ["pytest>=9.0.3", "pytest-cov>=7.1.0", "tytonai-test==0.5.3"]
+
+[dependency-groups]
+storage = ["google-cloud-storage>=3.0.0"]
+pytorch = ["dinov3", "torch==2.11.0", "torchvision==0.26.0"]
+test = ["pytest>=9.0.3", "pytest-cov>=7.1.0", "tytonai-test==0.5.3"]
+
+[tool.uv]
+default-groups = ["storage", "pytorch", "test"]
+
+[tool.uv.sources]
+"color-operations" = { index = "tytonai" }
+"dinov3-embedding" = { git = "https://github.com/millcrest/tytonai-python-activities", subdirectory = "dinov3_embedding", branch = "main" }
+"bbox_to_tile_grid" = { git = "https://github.com/millcrest/tytonai-python-activities", subdirectory = "bbox_to_tile_grid", branch = "main" }
+"clip_raster_tile" = { git = "https://github.com/millcrest/tytonai-python-activities", subdirectory = "clip_raster_tile", branch = "main" }
+"dinov3" = { git = "https://github.com/facebookresearch/dinov3.git", rev = "31703e4cbf1ccb7c4a72daa1350405f86754b6d1" }
+"tytonai_utils"    = { git = "https://github.com/clement-tyton/tytonai_utils.git" }
+
+
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+"tytonai.core" = { index = "tytonai" }
+"tytonai.api" = { index = "tytonai" }
+"tytonai.gis" = { index = "tytonai" }
+"tytonai.gdal" = { index = "tytonai" }
+"tytonai.test" = { index = "tytonai" }
+
+[[tool.uv.index]]
+name = "tytonai"
+url = "https://asia-southeast1-python.pkg.dev/tyton-devops/python/simple/"
+authenticate = "always"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[build-system]
+requires = ["pdm-pep517"]
+build-backend = "pdm.pep517.api"
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[tool.coverage.run]
+branch = true
+parallel = true
+
+[tool.coverage.report]
+exclude_lines = ["no cov", "if __name__ == .__main__.:", "if TYPE_CHECKING:"]
+omit = ["**/debug.py"]
+
+

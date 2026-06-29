@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: "3"
+
+includes:
+  activity:
+    taskfile: taskfile.activity.yaml
+    flatten: true
+
+tasks:
+  setup:auth:
+    desc: Setup Google Cloud authentication for python packages
+    silent: true
+    cmds:
+      - uv tool install keyring --with keyrings.google-artifactregistry-auth
+      - echo "export UV_KEYRING_PROVIDER=subprocess" > ~/.python-tytonai-keyring-provider
+      - echo "export UV_INDEX_TYTONAI_USERNAME=oauth2accesstoken" >> ~/.python-tytonai-keyring-provider
+      - if ! grep -q "source ~/.python-tytonai-keyring-provider" ~/.profile; then echo -e "\nsource ~/.python-tytonai-keyring-provider" >> ~/.profile; fi
+      - if ! grep -q "source ~/.python-tytonai-keyring-provider" ~/.bashrc; then echo -e "\nsource ~/.python-tytonai-keyring-provider" >> ~/.bashrc; fi
+      - echo "restart your shell or run 'source ~/.profile' to apply the changes"
+
+  install:gcloud:
+    desc: Install Google Cloud CLI
+    interactive: true
+    cmds:
+      - sudo apt-get update
+      - sudo apt-get install ca-certificates gnupg curl
+      - curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+      - echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+      - sudo apt-get update && sudo apt-get install google-cloud-cli

@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: "3"
+
+vars:
+  CURRENT_DIR:
+    sh: echo $(basename '{{.USER_WORKING_DIR}}')
+
+tasks:
+  build:
+    desc: Build one or more activity docker images.
+    interactive: true
+    cmds:
+      - .scripts/choose-activity .scripts/docker-build-google.sh "{{.CURRENT_DIR}}"
+
+  build:local:
+    desc: Build one or more activity docker images.
+    interactive: true
+    env:
+      LOCAL_ONLY: "true"
+    cmds:
+      - .scripts/choose-activity .scripts/docker-build-google.sh "{{.CURRENT_DIR}}"
+
+  update:
+    desc: Update and validate an activity.
+    interactive: true
+    cmds:
+      - .scripts/choose-activity .scripts/update-activity "{{.CURRENT_DIR}}"
+
+  install:
+    desc: Update, validate and install the venv for an activity.
+    interactive: true
+    cmds:
+      - .scripts/choose-activity .scripts/update-activity-venv "{{.CURRENT_DIR}}"
+
+  check:
+    desc: Run linting, formatting and type checking on an activity.
+    interactive: true
+    cmds:
+      - .scripts/choose-activity .scripts/check-activity "{{.CURRENT_DIR}}"
+
+  version:
+    desc: Check if the current version of an activity has been published.
+    interactive: true
+    cmds:
+      - .scripts/choose-activity .scripts/check-activity-image "{{.CURRENT_DIR}}"

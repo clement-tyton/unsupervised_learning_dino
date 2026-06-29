@@ -1,0 +1,9 @@
+{
+    "crs": "EPSG:28351",
+    "resolution_m": 0.0247,
+    "resolution_note": "raster native resolution = 2.06 cm/px (WGS 84 / UTM zone 29N)",
+    "webmap_s3": "s3://c1cc6b74-6aa7-11f1-b078-5f348e776dae/4414e780-b298-4e9f-b24e-e073963dc782/RED_GREEN_BLUE_ALPHA_webmap.tif",
+    "fgbs": [
+        "study_area.fgb"
+    ]
+}

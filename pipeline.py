@@ -167,7 +167,6 @@ def run_visual_analysis(paths, ckpt, weights=WEIGHTS, device="cpu", n_tiles=30):
     report = paths["out"] / "report"
     d = _make_sections(report, ["00_method", "01_features", "02_change", "03_expressiveness"])
     print(f"[viz] {paths['name']}/{area}: {len(all_tiles)} tiles ({len(tiles)} sampled) on {device} -> {report}")
-
     sections = [
         ("method",         lambda: report_method(tiles_dir, d["00_method"])),
         ("features",       lambda: report_features(weights, ckpt, tiles, all_tiles, d["01_features"], device)),
@@ -203,22 +202,36 @@ def run_evaluation(paths, ckpt, weights=WEIGHTS, device="cpu", n_clusters=8):
 
 
 # ── 5) segmentation comparison (UNet vs DINO seg heads, on the aligned tiles) ─────────
-def run_segmentation_comparison(paths, ckpt, weights=WEIGHTS, device="cpu", epochs=50,
-                                unet_epochs=5, dino_batch=4, unet_batch=32, mlflow=True):
-    """Train + validate UNet vs ConvSegHead on frozen DINO (pretrained & finetuned), on the
-    aligned tiles + honest area split. `epochs` = DINO heads (cheap full passes); `unet_epochs`
-    = the prod-like UNet (6000 samples/epoch, so far fewer). Logs each model to the MLflow
-    comparison experiment ('dino_segmentation_comparison'). Needs aligned masks (run
-    align_annotations); the UNet also needs unet_config.json (epoch_file_key + activation:null)."""
-    from src.evaluation.segmentation_compare import compare_segmentation
+def run_dino_seg_heads(paths, ckpt, weights=WEIGHTS, device="cpu", epochs=50,
+                       dino_batch=4, mlflow=True):
+    """Train + validate the two frozen-DINO ConvSegHeads (pretrained & finetuned) on the aligned
+    tiles + honest area split. Cheap (cached features). Logs each head to the MLflow comparison
+    experiment ('dino_segmentation_comparison'). Needs aligned masks (run align_annotations)."""
+    from src.evaluation.segmentation_compare import compare_dino_heads
     if not paths["masks"].exists():
-        print("[pipeline] no aligned masks — run align_annotations first; skipping seg comparison")
+        print("[pipeline] no aligned masks — run align_annotations first; skipping DINO seg heads")
         return None
-    mc = paths["model_config"] if paths["model_config"].exists() else None
-    res, split = compare_segmentation(weights, ckpt, paths["rgb"], paths["masks"], mc,
-                                      device=device, epochs=epochs, unet_epochs=unet_epochs,
-                                      dino_batch=dino_batch, unet_batch=unet_batch,
-                                      mlflow=mlflow, site=paths["name"])
+    res, split = compare_dino_heads(weights, ckpt, paths["rgb"], paths["masks"],
+                                    device=device, epochs=epochs, dino_batch=dino_batch,
+                                    mlflow=mlflow, site=paths["name"])
+    return res
+
+
+def run_unet_seg(paths, device="cpu", unet_epochs=5, unet_batch=32, mlflow=True):
+    """Train + validate the prod-like UNet BASELINE (trained Mega Model body + fresh head) on the
+    aligned tiles + area split. Self-contained — NO DINO checkpoint needed (this chain stands on
+    its own). `unet_epochs` is small (6000 samples/epoch). Logs to the MLflow comparison experiment.
+    Needs aligned masks AND unet_config.json (epoch_file_key + activation:null)."""
+    from src.evaluation.segmentation_compare import compare_unet
+    if not paths["masks"].exists():
+        print("[pipeline] no aligned masks — run align_annotations first; skipping UNet seg")
+        return None
+    if not paths["model_config"].exists():
+        print("[pipeline] no unet_config.json — skipping UNet seg")
+        return None
+    res, split = compare_unet(paths["rgb"], paths["masks"], paths["model_config"],
+                              device=device, unet_epochs=unet_epochs, unet_batch=unet_batch,
+                              mlflow=mlflow, site=paths["name"])
     return res
 
 
@@ -228,10 +241,11 @@ def run_segmentation_comparison(paths, ckpt, weights=WEIGHTS, device="cpu", epoc
 # ════════════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     # --- choose ONE site ---
+    
     CONFIG = {
         #"site_dir": "input_site_data/EM2020_Jimblebar_Rail",
         "site_dir": "input_site_data/manned_bens_oasis_wet",
-        #l"site_dir": "input_site_data/monrovia",
+        #"site_dir": "input_site_data/monrovia",
         # 50 epochs, MLflow on (experiment 'dino_lora_finetune'), checkpoint every 10 epochs
        "train": dict(epochs=50, n_local=4, batch_size=2, grad_accum=4,
                       max_steps=None, save_every_epochs=10, mlflow=True),
@@ -250,5 +264,6 @@ if __name__ == "__main__":
     
     run_visual_analysis(paths, ckpt, device=CONFIG["device"])   # 3) pretrained-vs-finetuned pictures
     run_evaluation(paths, ckpt, device=CONFIG["device"])        # 4) cluster / confusion / probe on aligned tiles
-    run_segmentation_comparison(paths, ckpt, device="cuda:1", epochs=50, unet_epochs=5)  # 5) UNet vs DINO seg heads (-> MLflow)
+    run_dino_seg_heads(paths, ckpt, device="cuda:1", epochs=50)        # 5a) 2 DINO seg heads (cheap, cached -> MLflow)
+    run_unet_seg(paths, device="cuda:1", unet_epochs=10)               # 5b) prod-like UNet baseline (standalone -> MLflow)
 

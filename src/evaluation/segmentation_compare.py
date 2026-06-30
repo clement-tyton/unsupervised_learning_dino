@@ -190,7 +190,7 @@ def _log_seg_run(site, scenario, metrics, config, experiment=SEG_EXPERIMENT, tra
                     scalars[k] = metrics[k]
             for nm, v in metrics.get("per_f1", {}).items():     # per-class F1 (skip NaN classes)
                 if not (isinstance(v, float) and math.isnan(v)):
-                    scalars[f"f1/{nm}"] = v
+                    scalars[f"f1/{nm.replace(' ', '_')}"] = v    # MLflow-safe metric key
             run.log(scalars)
         print(f"    logged -> mlflow[{experiment}] {site}__{scenario}")
     except Exception as e:
@@ -304,7 +304,7 @@ def _rgb512(path, size=512):
     return np.array(Image.fromarray(_tif_rgb(path)).resize((size, size)))
 
 
-def train_unet(imgs, targets, tr_idx, model_config, K1, device="cpu", epochs=30, lr=1e-4,
+def train_unet(imgs, targets, tr_idx, model_config, K1, device="cpu", epochs=30, lr=1e-3,
                batch_size=32, grad_accum=8, samples_per_epoch=6000, crop=256, balance=True,
                class_weight=None, weights_dir="model_weight/unet", seed=0):
     """Prod-like UNet fine-tune (mirrors object_train's recipe, kept SINGLE-LABEL for the
@@ -325,6 +325,8 @@ def train_unet(imgs, targets, tr_idx, model_config, K1, device="cpu", epochs=30,
         raise KeyError("model config needs 'epoch_file_key' (s3://...pth) — rename your "
                        "'epoch_v2_file_key' to 'epoch_file_key'.")
     torch.manual_seed(seed)
+    cfg = read_model_config(model_config)["config"]               # site stats the body was trained on
+    mean, std = cfg["train_mean"], cfg["train_std"]
     wpath = download_model_weights_from_config(model_config, weights_dir)
     model = load_model_with_fresh_head_from_config(model_config, wpath, num_classes=K1,
                                                    freeze_encoder=False).to(device)
@@ -337,7 +339,9 @@ def train_unet(imgs, targets, tr_idx, model_config, K1, device="cpu", epochs=30,
     pool = _balance_pool(targets, tr_idx, K1, seed) if balance else np.asarray(tr_idx)
     rgb = {int(j): _rgb512(imgs[j]) for j in np.unique(pool)}    # cache (512,512,3) RGB per used tile
     aug = albu.Compose([albu.RandomCrop(crop, crop), albu.HorizontalFlip(p=0.5),
-                        albu.VerticalFlip(p=0.5), albu.Normalize(), ToTensorV2()])   # ImageNet norm
+                        albu.VerticalFlip(p=0.5),
+                        albu.Normalize(mean=mean, std=std, max_pixel_value=1.0),  # site stats (0–255)
+                        ToTensorV2()])
     amp = "cuda" in str(device)
     steps = samples_per_epoch // batch_size
     model.train(); curve = []; t0 = time.perf_counter()

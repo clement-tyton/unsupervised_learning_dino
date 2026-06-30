@@ -33,8 +33,21 @@ from src.visualisation.features import pre_ft_features
 
 EVAL_CACHE = Path("outputs/_feature_cache_eval")        # .tif/512 (32x32) features, apart from the 224 viz cache
 
-CLASS_NAMES = {0: "(ignore)", 2: "Ground", 5: "Tree", 4: "Shrub", 9: "Generic debris",
-               201: "Water", 100: "Biotic", 200: "Abiotic", 7: "Grass"}
+CLASS_NAMES = {                                          # source class id -> human name (0 = ignore)
+    0: "(ignore)",
+    1: "Not Erosion", 2: "Ground", 4: "Shrub", 5: "Tree", 6: "Herb", 7: "Grass", 9: "Generic debris",
+    14: "Erosion", 40: "Sedge", 100: "Biotic", 200: "Abiotic", 201: "Water", 301: "Tussock",
+    10108: "Chile_Tree1", 10109: "Chile_Tree2", 10110: "Chile_Tree3", 10111: "Chile_Shrub1",
+    10115: "Eucalyptus spp", 10117: "Melaleuca Argentea", 10118: "Cenchrus spp",
+    10119: "Hummock Grass", 10120: "Aerva javanica", 10121: "Annual herbs and grasses",
+    10122: "Phoenix dactylifera", 10123: "Eucalyptus camaldulensis", 10124: "Eucalyptus victrix",
+    10125: "Mulga", 10126: "Calotropis procera",
+}
+
+# Source-id remap applied at mask read (raw id -> canonical id), so a site's odd codes fold into
+# the right taxonomy class everywhere (present_classes / targets / F1 / MLflow). E.g. manned's
+# 10116 is Tussock grass -> 301. Add entries here as new sites surface non-standard codes.
+CLASS_REMAP = {10116: 301}
 
 
 # ── aligned .tif IO (imagery tile <-> grid-aligned mask tile, paired by stem) ─────────
@@ -65,9 +78,14 @@ def _tif_rgb(tif_path):
 
 
 def read_mask(mask_path):
-    """The (H,W) class annotation: band 1 of a grid-aligned mask .tif."""
+    """The (H,W) class annotation: band 1 of a grid-aligned mask .tif, with CLASS_REMAP applied
+    so non-standard source codes fold into their canonical class (e.g. manned's leftover 10116
+    artefacts -> 301 Tussock)."""
     with rasterio.open(mask_path) as src:
-        return src.read(1)
+        m = src.read(1)
+    for src_id, dst_id in CLASS_REMAP.items():
+        m[m == src_id] = dst_id
+    return m
 
 
 def _drop_small(imgs, masks, min_side):

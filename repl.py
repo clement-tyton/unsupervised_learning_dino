@@ -54,3 +54,38 @@ for fgb in config["fgbs"]:
 # print(f"wrote {len(written)} / {len(grid)} tiles -> {SITE / 'RGB' / name}")
 
 # preview_tiles(SITE / "RGB" / name, downscale=16, out_png=SITE / f"overview_{name}.png")
+
+
+from tytonai_utils.webmap import build_grid, download_grid, plot_grid, preview_tiles
+from tytonai_utils.viz import plot_image_mask_pairs, plot_image_mask_tiles
+from tytonai_utils.rollup import (
+    CLASS_NAMES, RND_NAMES_6CLASS, RND_NAMES_7CLASS,
+    RND_REMAP_6CLASS, RND_REMAP_7CLASS, rollup_annotations, rollup_mask,
+)
+
+preview_tiles(
+    "input_site_data/EM2020_Jimblebar_Rail/RGB/study_area", downscale=16, out_png="preview.png"
+)
+
+
+plot_image_mask_pairs(
+    "input_site_data/monrovia/annotations",
+    "input_site_data/monrovia/dataset.json",
+    [0,1,2],
+    CLASS_NAMES,
+    out_png= "lol.png"
+)
+
+
+plot_image_mask_pairs(
+    "input_site_data/monrovia/annotations",
+    "input_site_data/monrovia/dataset.json",
+    [0,1,2],
+    ,
+    out_png= "lol.png"
+)
+
+site = "manned_bens_oasis_wet"
+plot_image_mask_tiles(f'input_site_data/{site}/RGB/study_area_1', 
+                      f'input_site_data/{site}/masks/study_area_1', n=6,
+                      out_png="pairs_aligned.png")

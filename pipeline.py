@@ -250,5 +250,5 @@ if __name__ == "__main__":
     
     run_visual_analysis(paths, ckpt, device=CONFIG["device"])   # 3) pretrained-vs-finetuned pictures
     run_evaluation(paths, ckpt, device=CONFIG["device"])        # 4) cluster / confusion / probe on aligned tiles
-    run_segmentation_comparison(paths, ckpt, device="cuda:1", epochs=50)  # 5) UNet vs DINO seg heads (-> MLflow)
+    run_segmentation_comparison(paths, ckpt, device="cuda:1", epochs=50, unet_epochs=5)  # 5) UNet vs DINO seg heads (-> MLflow)
 

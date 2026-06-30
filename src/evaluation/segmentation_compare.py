@@ -116,17 +116,32 @@ def build_targets(masks, id2idx, out_size=512):
     return torch.stack(ts)                                       # (T, out, out)
 
 
+# ── class balancing: shared inverse-frequency CE weights (same recipe for every model) ──
+def class_weights(targets, tr_idx, K1):
+    """Inverse-frequency CrossEntropy class weights from the TRAIN tiles only (no val leakage).
+    weight_c ∝ 1 / pixel_count_c over the real classes (mean-normalised ~1); index 0 = ignore -> 0.
+    Computed ONCE and passed to every model so all three train with the identical balanced loss."""
+    import numpy as np
+    cnt = np.bincount(targets[tr_idx].numpy().ravel(), minlength=K1).astype(float)
+    w = np.zeros(K1, dtype=np.float32)
+    real = cnt[1:]
+    nz = real > 0
+    w[1:][nz] = real[nz].sum() / (nz.sum() * real[nz])           # inverse freq, averages to ~1
+    return torch.from_numpy(w)
+
+
 # ── DINO head training (on FROZEN cached features — fast) ───────────────────────────
 def train_dino_head(feats, targets, tr_idx, K1, device="cpu", epochs=30, lr=1e-3,
-                    batch_size=4, seed=0):
+                    batch_size=4, class_weight=None, seed=0):
     """Train a fresh ConvSegHead on FROZEN features `feats` (T,N,D) -> full-res logits, against
-    the remapped `targets` (T,out,out), with CrossEntropyLoss(ignore_index=0). The ViT backbone
-    never runs (features are cached), so this is cheap. Times ONLY the optimization loop.
-    Returns (head, {train_time_s, loss_curve, final_loss, n_params, n_train})."""
+    the remapped `targets` (T,out,out), with class-weighted CrossEntropyLoss(ignore_index=0). The
+    ViT backbone never runs (features are cached), so this is cheap. Times ONLY the optimization
+    loop. Returns (head, {train_time_s, loss_curve, final_loss, n_params, n_train})."""
     torch.manual_seed(seed)
     head = ConvSegHead(in_dim=feats.shape[-1], n_classes=K1).to(device)
     opt = torch.optim.AdamW(head.parameters(), lr=lr)
-    ce = nn.CrossEntropyLoss(ignore_index=0)
+    cw = class_weight.to(device) if class_weight is not None else None
+    ce = nn.CrossEntropyLoss(weight=cw, ignore_index=0)
     Xtr, Ytr = feats[tr_idx], targets[tr_idx]                    # kept on CPU; batches move to device
     n = len(tr_idx)
     head.train()
@@ -263,20 +278,52 @@ def _prepare(weights, ckpt, rgb_root, masks_root, device, img_size, test_frac, s
 
 
 # ── UNet end-to-end training (whole net runs; reuses the trained Mega Model weights) ──
+def _balance_pool(targets, tr_idx, K1, seed=112, upsample_power=0.2, data_control=0.2):
+    """data_balance: oversample the TRAIN tiles by class pixel-counts -> a multiset of TILE indices
+    (rare-class tiles repeated). Mirrors DataBalance.start()'s target computation. Returns the
+    balanced index array (values are indices into imgs/targets, with repetition)."""
+    import math
+    import numpy as np
+    from data_balance.sampling import calculate_sample, select_tiles
+    np.random.seed(seed)
+    Y = targets[tr_idx].numpy()                                  # (n_tr, H, W) remapped labels
+    tile_arr = np.stack([np.bincount(y.ravel(), minlength=K1)[1:] for y in Y]).astype(np.float64)  # drop ignore
+    lifeform, total = tile_arr.sum(0), tile_arr.sum()
+    prob = np.where(lifeform > 0, (lifeform / total) ** upsample_power, 0.0)
+    target = np.array([math.ceil(data_control * total * 3 * p) for p in prob], dtype=np.int32)
+    samp = calculate_sample(len(tile_arr), tile_arr, target, lifeform)
+    bal = select_tiles(tile_arr, samp, target, lifeform, max(2 * len(tile_arr), 500_000))
+    return np.asarray(tr_idx)[np.asarray(bal, dtype=np.int64)]
+
+
+def _rgb512(path, size=512):
+    """(size,size,3) uint8 RGB (per-band stretched, resized) — input to albumentations."""
+    import numpy as np
+    from PIL import Image
+    from src.evaluation.separability import _tif_rgb
+    return np.array(Image.fromarray(_tif_rgb(path)).resize((size, size)))
+
+
 def train_unet(imgs, targets, tr_idx, model_config, K1, device="cpu", epochs=30, lr=1e-4,
-               batch_size=2, weights_dir="model_weight/unet", seed=0):
-    """Fine-tune the UNet end-to-end (RGB 512 -> mask). Reuses the trained Mega Model
-    encoder+decoder + a fresh head (NOT frozen) from the config; the WHOLE net runs (no feature
-    cache), bf16 autocast on CUDA, CrossEntropyLoss(ignore_index=0). Times the loop. Returns
-    (model, metrics). batch_size is small (2) — res2net101 UNet @512 is memory-heavy."""
+               batch_size=32, grad_accum=8, samples_per_epoch=6000, crop=256, balance=True,
+               class_weight=None, weights_dir="model_weight/unet", seed=0):
+    """Prod-like UNet fine-tune (mirrors object_train's recipe, kept SINGLE-LABEL for the
+    comparison): trained Mega Model encoder+decoder + fresh head (NOT frozen); data_balance
+    oversampling of the train tiles; albumentations augmentation (random crop + H/V flips, like
+    object_train); micro-batch `batch_size` with gradient accumulation `grad_accum` (effective
+    batch = batch*accum); `samples_per_epoch` random draws/epoch from the balanced pool; bf16
+    autocast; class-weighted CE(ignore_index=0) — SAME loss/eval as the DINO heads.
+    Returns (model, metrics)."""
+    import albumentations as albu
+    import numpy as np
+    from albumentations.pytorch import ToTensorV2
     from dotenv import load_dotenv
     from tytonai_utils.model import (download_model_weights_from_config,
                                      load_model_with_fresh_head_from_config, read_model_config)
-    from src.visualisation.common import _embed_tensor
     load_dotenv(".env", override=True)                          # AWS creds for the weights download
     if "epoch_file_key" not in read_model_config(model_config):
-        raise KeyError("model config needs 'epoch_file_key' (s3://...pth) — yours has "
-                       "'epoch_v2_file_key'; rename/add it.")
+        raise KeyError("model config needs 'epoch_file_key' (s3://...pth) — rename your "
+                       "'epoch_v2_file_key' to 'epoch_file_key'.")
     torch.manual_seed(seed)
     wpath = download_model_weights_from_config(model_config, weights_dir)
     model = load_model_with_fresh_head_from_config(model_config, wpath, num_classes=K1,
@@ -284,32 +331,38 @@ def train_unet(imgs, targets, tr_idx, model_config, K1, device="cpu", epochs=30,
     if hasattr(model, "segmentation_head"):                     # CE needs logits: drop config activation
         model.segmentation_head[-1] = nn.Identity()
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    ce = nn.CrossEntropyLoss(ignore_index=0)
-    tr_imgs, Ytr = [imgs[i] for i in tr_idx], targets[tr_idx]
-    n, amp = len(tr_idx), "cuda" in str(device)
-    model.train()
-    curve = []
-    t0 = time.perf_counter()
-    n_batches = (n + batch_size - 1) // batch_size
-    bar = tqdm(total=epochs * n_batches, desc="unet train")           # per-batch (UNet is slow)
+    cw = class_weight.to(device) if class_weight is not None else None
+    ce = nn.CrossEntropyLoss(weight=cw, ignore_index=0)
+
+    pool = _balance_pool(targets, tr_idx, K1, seed) if balance else np.asarray(tr_idx)
+    rgb = {int(j): _rgb512(imgs[j]) for j in np.unique(pool)}    # cache (512,512,3) RGB per used tile
+    aug = albu.Compose([albu.RandomCrop(crop, crop), albu.HorizontalFlip(p=0.5),
+                        albu.VerticalFlip(p=0.5), albu.Normalize(), ToTensorV2()])   # ImageNet norm
+    amp = "cuda" in str(device)
+    steps = samples_per_epoch // batch_size
+    model.train(); curve = []; t0 = time.perf_counter()
+    bar = tqdm(total=epochs * steps, desc="unet train")
+    rng = np.random.default_rng(seed)
     for ep in range(epochs):
-        perm = torch.randperm(n)
-        total = 0.0
-        for i in range(0, n, batch_size):
-            b = perm[i:i + batch_size].tolist()
-            xb = torch.stack([_embed_tensor(tr_imgs[j], 512) for j in b]).to(device)
-            yb = Ytr[b].to(device)
+        draw = rng.choice(pool, size=samples_per_epoch, replace=True)   # 6000 balanced draws / epoch
+        total = 0.0; opt.zero_grad()
+        for s in range(steps):
+            sel = draw[s * batch_size:(s + 1) * batch_size]
+            au = [aug(image=rgb[int(j)], mask=targets[j].numpy()) for j in sel]
+            xb = torch.stack([a["image"] for a in au]).to(device)
+            yb = torch.stack([a["mask"] for a in au]).long().to(device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp):
-                loss = ce(model(xb), yb)
-            opt.zero_grad(); loss.backward(); opt.step()
-            total += loss.item() * len(b)
-            bar.update(1)
-            bar.set_postfix(ep=f"{ep + 1}/{epochs}", loss=f"{total / min(i + batch_size, n):.3f}")
-        curve.append(total / n)
+                loss = ce(model(xb), yb) / grad_accum            # scale for accumulation
+            loss.backward()
+            total += loss.item() * grad_accum
+            if (s + 1) % grad_accum == 0:                        # optimizer step every `grad_accum`
+                opt.step(); opt.zero_grad()
+            bar.update(1); bar.set_postfix(ep=f"{ep + 1}/{epochs}", loss=f"{total / (s + 1):.3f}")
+        curve.append(total / steps)
     bar.close()
     return model, {"train_time_s": time.perf_counter() - t0, "loss_curve": curve,
                    "final_loss": curve[-1], "n_params": sum(p.numel() for p in model.parameters()),
-                   "n_train": n}
+                   "n_train": len(tr_idx), "n_pool": len(pool)}
 
 
 def train_dino_heads(weights, ckpt, rgb_root, masks_root, device="cpu", img_size=512,
@@ -320,10 +373,11 @@ def train_dino_heads(weights, ckpt, rgb_root, masks_root, device="cpu", img_size
     logs each to `experiment` (one run per variant, same server). Returns ({variant: (head, metrics)}, split)."""
     site = site or Path(rgb_root).parent.name                    # e.g. .../monrovia/RGB -> "monrovia"
     d = _prepare(weights, ckpt, rgb_root, masks_root, device, img_size, test_frac, seed)
+    cw = class_weights(d["targets"], d["tr_idx"], d["K1"])       # one balanced loss for both heads
     res = {}
     for name, feats in [("pretrained", d["pre"]), ("finetuned", d["ft"])]:
         head, m = train_dino_head(feats, d["targets"], d["tr_idx"], d["K1"], device, epochs,
-                                  batch_size=batch_size, seed=seed)
+                                  batch_size=batch_size, class_weight=cw, seed=seed)
         per_f1, m["val_f1"], m["val_pixel_acc"] = eval_head(head, feats, d["targets"], d["te_idx"],
                                                             d["K1"], device)
         m["per_f1"] = dict(zip(d["names"][1:], per_f1.tolist()))
@@ -341,15 +395,16 @@ def train_dino_heads(weights, ckpt, rgb_root, masks_root, device="cpu", img_size
 
 
 def compare_segmentation(weights, ckpt, rgb_root, masks_root, model_config, device="cpu",
-                         img_size=512, epochs=30, dino_batch=4, unet_batch=2, test_frac=0.3,
-                         seed=0, mlflow=False, site=None, experiment=SEG_EXPERIMENT):
+                         img_size=512, epochs=50, unet_epochs=5, dino_batch=4, unet_batch=32,
+                         test_frac=0.3, seed=0, mlflow=False, site=None, experiment=SEG_EXPERIMENT):
     """Train + VALIDATE all THREE models (DINO pretrained head, DINO finetuned head, UNet) on the
-    SAME aligned tiles and SAME area split. Reports macro-F1 / per-class F1 / pixel-acc; with
-    mlflow=True logs each as a run in the comparison experiment. The UNet is best-effort (needs S3
-    weights + 'epoch_file_key'); if it can't build, the DINO results still come through. Returns
-    ({model: (net, metrics)}, split)."""
+    SAME aligned tiles and SAME area split. `epochs` is for the DINO heads (cheap, full passes over
+    the train tiles); `unet_epochs` is separate (the UNet does samples_per_epoch=6000 draws/epoch,
+    so far fewer epochs). Reports macro-F1 / per-class F1 / pixel-acc; with mlflow=True logs each as
+    a run in the comparison experiment. UNet is best-effort (needs S3 weights + 'epoch_file_key')."""
     site = site or Path(rgb_root).parent.name
     d = _prepare(weights, ckpt, rgb_root, masks_root, device, img_size, test_frac, seed)
+    cw = class_weights(d["targets"], d["tr_idx"], d["K1"])       # SAME balanced loss for all 3 models
     res = {}
 
     def _finish(label, net, m, val, cfg):
@@ -364,16 +419,16 @@ def compare_segmentation(weights, ckpt, rgb_root, masks_root, model_config, devi
 
     for label, feats in [("dino_pretrained", d["pre"]), ("dino_finetuned", d["ft"])]:
         head, m = train_dino_head(feats, d["targets"], d["tr_idx"], d["K1"], device, epochs,
-                                  batch_size=dino_batch, seed=seed)
+                                  batch_size=dino_batch, class_weight=cw, seed=seed)
         val = eval_head(head, feats, d["targets"], d["te_idx"], d["K1"], device)
         _finish(label, head, m, val, dict(model=label, epochs=epochs, lr=1e-3,
                                           batch_size=dino_batch, test_frac=test_frac, seed=seed, K1=d["K1"]))
 
     try:                                                         # UNet — heavier, best-effort
         model, m = train_unet(d["imgs"], d["targets"], d["tr_idx"], model_config, d["K1"],
-                              device, epochs, batch_size=unet_batch, seed=seed)
+                              device, unet_epochs, batch_size=unet_batch, class_weight=cw, seed=seed)
         val = eval_unet(model, d["imgs"], d["targets"], d["te_idx"], d["K1"], device, img_size)
-        _finish("unet", model, m, val, dict(model="unet_megamodel_freshhead", epochs=epochs,
+        _finish("unet", model, m, val, dict(model="unet_megamodel_freshhead", epochs=unet_epochs,
                                             lr=1e-4, batch_size=unet_batch, test_frac=test_frac,
                                             seed=seed, K1=d["K1"]))
     except Exception as e:

@@ -203,20 +203,22 @@ def run_evaluation(paths, ckpt, weights=WEIGHTS, device="cpu", n_clusters=8):
 
 
 # ── 5) segmentation comparison (UNet vs DINO seg heads, on the aligned tiles) ─────────
-def run_segmentation_comparison(paths, ckpt, weights=WEIGHTS, device="cpu", epochs=30,
-                                dino_batch=4, unet_batch=2, mlflow=True):
+def run_segmentation_comparison(paths, ckpt, weights=WEIGHTS, device="cpu", epochs=50,
+                                unet_epochs=5, dino_batch=4, unet_batch=32, mlflow=True):
     """Train + validate UNet vs ConvSegHead on frozen DINO (pretrained & finetuned), on the
-    aligned tiles + honest area split. Logs each model to the MLflow comparison experiment
-    ('dino_segmentation_comparison'). Needs aligned masks (run align_annotations); the UNet also
-    needs unet_config.json (with epoch_file_key + activation:null) — else it's skipped."""
+    aligned tiles + honest area split. `epochs` = DINO heads (cheap full passes); `unet_epochs`
+    = the prod-like UNet (6000 samples/epoch, so far fewer). Logs each model to the MLflow
+    comparison experiment ('dino_segmentation_comparison'). Needs aligned masks (run
+    align_annotations); the UNet also needs unet_config.json (epoch_file_key + activation:null)."""
     from src.evaluation.segmentation_compare import compare_segmentation
     if not paths["masks"].exists():
         print("[pipeline] no aligned masks — run align_annotations first; skipping seg comparison")
         return None
     mc = paths["model_config"] if paths["model_config"].exists() else None
     res, split = compare_segmentation(weights, ckpt, paths["rgb"], paths["masks"], mc,
-                                      device=device, epochs=epochs, dino_batch=dino_batch,
-                                      unet_batch=unet_batch, mlflow=mlflow, site=paths["name"])
+                                      device=device, epochs=epochs, unet_epochs=unet_epochs,
+                                      dino_batch=dino_batch, unet_batch=unet_batch,
+                                      mlflow=mlflow, site=paths["name"])
     return res
 
 
@@ -228,10 +230,10 @@ if __name__ == "__main__":
     # --- choose ONE site ---
     CONFIG = {
         #"site_dir": "input_site_data/EM2020_Jimblebar_Rail",
-        # "site_dir": "input_site_data/manned_bens_oasis_wet",
-        "site_dir": "input_site_data/monrovia",
+        "site_dir": "input_site_data/manned_bens_oasis_wet",
+        #l"site_dir": "input_site_data/monrovia",
         # 50 epochs, MLflow on (experiment 'dino_lora_finetune'), checkpoint every 10 epochs
-        "train": dict(epochs=50, n_local=4, batch_size=2, grad_accum=4,
+       "train": dict(epochs=50, n_local=4, batch_size=2, grad_accum=4,
                       max_steps=None, save_every_epochs=10, mlflow=True),
         "device": "cpu",                                   # analysis/eval (cached -> cpu is fine)
     }
@@ -243,9 +245,10 @@ if __name__ == "__main__":
     align_annotations(paths)                                # 1c) realign npz masks onto the .tif imagery grid
 
     ckpt = train_site(paths, **CONFIG["train"])            # 2) finetune -> checkpoints/<site>/{epoch010..050,final}.pt
-    ckpt = paths["ckpt"]  
+    ckpt = paths["ckpt"]
+    # ckpt  =  "checkpoints/monrovia__r16-K65k-dino+ibot+gram+koleo-sat/final.pt"  
     
     run_visual_analysis(paths, ckpt, device=CONFIG["device"])   # 3) pretrained-vs-finetuned pictures
     run_evaluation(paths, ckpt, device=CONFIG["device"])        # 4) cluster / confusion / probe on aligned tiles
-    run_segmentation_comparison(paths, ckpt, device="cuda:1", epochs=30)  # 5) UNet vs DINO seg heads (-> MLflow)
+    run_segmentation_comparison(paths, ckpt, device="cuda:1", epochs=50)  # 5) UNet vs DINO seg heads (-> MLflow)
 

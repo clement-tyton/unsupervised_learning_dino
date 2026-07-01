@@ -32,11 +32,12 @@ def _write_readme(out_dir: Path, weights: str, ckpt: str, img_size: int, g: int,
     """Drop a README.txt describing the bundle layout + provenance."""
     (out_dir / "README.txt").write_text(
         f"{out_dir.name} — matched per-tile data (align the 3 dirs by filename stem)\n\n"
-        f"  tif_tiles/<tile>.tif                RGB imagery tile (input)\n"
+        f"  tif_tiles/<tile>.tif                RGB imagery tile (input, full source resolution)\n"
         f"  embeddings_pretrained/<tile>.npz    DINOv3-SAT pretrained features (LoRA=0)\n"
         f"  embeddings_finetuned/<tile>.npz     finetuned checkpoint features\n\n"
         f"Each .npz has keys: 'patches' (N,1024) float16, 'cls' (1024,) float32.\n"
-        f"N = (img_size/16)^2 = {g * g} patches at img_size={img_size} ({g}x{g} grid).\n"
+        f"N = (img_size/16)^2 = {g * g} patches at img_size={img_size} ({g}x{g} grid),\n"
+        f"computed on the tile downscaled to {img_size}px (the RGB .tif itself is kept full-res).\n"
         f"tiles   : {n}\n"
         f"weights : {Path(weights).name}\n"
         f"ckpt    : {ckpt}\n")
@@ -60,14 +61,18 @@ def export_exp(tiles: list[str], weights: str, ckpt: str, out_dir: str,
     """Build out_dir/{tif_tiles,embeddings_pretrained,embeddings_finetuned} + README from `tiles`.
     Builds the backbone ONCE on `device` (GPU), embeds all tiles pretrained, then switches the same
     student to the finetuned checkpoint and embeds again — streaming each tile to disk so RAM stays
-    flat even at full 512 resolution (1024 patches/tile)."""
+    flat even at full 512 resolution (1024 patches/tile).
+
+    The RGB .tif is copied at FULL source resolution (kept as-is, ~512px); only the DINO embeddings
+    are computed on the tile downscaled to `img_size` (224 -> 196 patches/tile, 512 -> 1024). So a
+    224 bundle = full-res RGB tiles + features from their 224 downscale."""
     from src.train.dino import load_checkpoint
     from src.visualisation.features import _load_pre_ft
     out = Path(out_dir)
     tif_dir = out / "tif_tiles"
     tif_dir.mkdir(parents=True, exist_ok=True)
     for tile in tiles:
-        shutil.copy(tile, tif_dir / f"{Path(tile).stem}.tif")
+        shutil.copy(tile, tif_dir / f"{Path(tile).stem}.tif")          # RGB kept at full source res
     print(f"loading backbone on {device} ...")
     student, teacher = _load_pre_ft(weights, ckpt, device)              # pretrained student, on GPU
     _embed_and_save(student, tiles, out / "embeddings_pretrained", device, img_size, batch_size)
@@ -87,11 +92,13 @@ CONFIG = {
     "tiles_dir": "input_site_data/curepto_chile/RGB",       # the site's .tif tiles (must be local)
     "weights": "model_weight/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth",
     "ckpt": "checkpoints/curepto_chile/final.pt",
-    "out_dir": "curepto_chile_exp",
+    "out_dir": "exp/curepto_chile_exp_224",                 # 224 variant -> own dir (don't clobber the 512 one)
     "device": "cuda:1",                                     # GPU forward (set "cpu" only as fallback)
-    "img_size": 512,                                        # FULL res -> 1024 patches/tile (32x32 grid)
-    "batch_size": 8,                                        # tiles/forward; lower if GPU OOM at 512
+    "img_size": 224,                                        # DINO on 224 downscale -> 196 patches/tile (14x14)
+    "batch_size": 8,                                        # tiles/forward; lower if GPU OOM
 }
+# Full-res 512 variant (1024 patches/tile): out_dir="exp/curepto_chile_exp", img_size=512.
+# In both, the RGB .tif is copied at full source resolution — only img_size changes the embeddings.
 
 tiles = collect_tiles(CONFIG["tiles_dir"])
 print(f"{len(tiles)} tiles under {CONFIG['tiles_dir']}")

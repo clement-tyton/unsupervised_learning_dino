@@ -3218,6 +3218,9 @@ model = [
 s3 = [
     { name = "boto3" },
 ]
+viz = [
+    { name = "matplotlib" },
+]
 webmap = [
     { name = "bbox-to-tile-grid" },
     { name = "geopandas" },
@@ -3253,7 +3256,7 @@ dependencies = [
     { name = "tqdm" },
     { name = "tytonai-core" },
     { name = "tytonai-gis", extra = ["geom", "raster", "tiff"] },
-    { name = "tytonai-utils", extra = ["model", "s3", "webmap"] },
+    { name = "tytonai-utils", extra = ["model", "s3", "viz", "webmap"] },
     { name = "zarr" },
 ]
 
@@ -3309,7 +3312,7 @@ requires-dist = [
     { name = "tytonai-core", specifier = "==0.5.3", index = "https://asia-southeast1-python.pkg.dev/tyton-devops/python/simple/" },
     { name = "tytonai-gis", extras = ["geom", "raster", "tiff"], specifier = "==0.5.3", index = "https://asia-southeast1-python.pkg.dev/tyton-devops/python/simple/" },
     { name = "tytonai-test", marker = "extra == 'test'", specifier = "==0.5.3", index = "https://asia-southeast1-python.pkg.dev/tyton-devops/python/simple/" },
-    { name = "tytonai-utils", extras = ["webmap", "s3", "model"], git = "https://github.com/clement-tyton/tytonai_utils.git" },
+    { name = "tytonai-utils", extras = ["webmap", "s3", "model", "viz", "s3", "align", "rollup"], git = "https://github.com/clement-tyton/tytonai_utils.git" },
     { name = "zarr", specifier = ">=3.0.0" },
 ]
 provides-extras = ["storage", "pytorch", "test"]

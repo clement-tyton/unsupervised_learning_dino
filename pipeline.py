@@ -179,13 +179,25 @@ def run_visual_analysis(paths, ckpt, weights=WEIGHTS, device="cpu", n_tiles=30):
 
 
 # ── 4) annotated evaluation (cluster / confusion / probe, on the aligned .tif tiles) ──
+def _has_aligned_tiles(paths) -> bool:
+    """True only if at least one imagery tile has a matching aligned mask. The masks/ dir can
+    exist yet be empty (e.g. a site with no CLASSIFY annotations), so checking the directory
+    isn't enough — an empty pair list crashes the eval downstream (empty torch.stack)."""
+    if not paths["masks"].exists():
+        return False
+    from src.evaluation.separability import aligned_pairs
+    imgs, _ = aligned_pairs(paths["rgb"], paths["masks"])
+    return len(imgs) > 0
+
+
+
 def run_evaluation(paths, ckpt, weights=WEIGHTS, device="cpu", n_clusters=8):
     """Cluster-vs-annotation + contingency + linear probe, on the .tif imagery tiles against
     the grid-aligned masks (run align_annotations first). Needs dataset.json + masks."""
     from src.evaluation.separability import (cluster_vs_annotation, confusion_cluster_vs_annotation,
                                              linear_probe_confusion, probe_split_map)
-    if not paths["masks"].exists():
-        print("[pipeline] no aligned masks — run align_annotations first; skipping evaluation")
+    if not _has_aligned_tiles(paths):
+        print("[pipeline] no aligned tiles — run align_annotations first; skipping evaluation")
         return None
     rgb, masks = paths["rgb"], paths["masks"]
     dst = _make_sections(paths["out"] / "report", ["04_evaluation"])["04_evaluation"]
@@ -208,8 +220,8 @@ def run_dino_seg_heads(paths, ckpt, weights=WEIGHTS, device="cpu", epochs=50,
     tiles + honest area split. Cheap (cached features). Logs each head to the MLflow comparison
     experiment ('dino_segmentation_comparison'). Needs aligned masks (run align_annotations)."""
     from src.evaluation.segmentation_compare import compare_dino_heads
-    if not paths["masks"].exists():
-        print("[pipeline] no aligned masks — run align_annotations first; skipping DINO seg heads")
+    if not _has_aligned_tiles(paths):
+        print("[pipeline] no aligned tiles — run align_annotations first; skipping DINO seg heads")
         return None
     res, split = compare_dino_heads(weights, ckpt, paths["rgb"], paths["masks"],
                                     device=device, epochs=epochs, dino_batch=dino_batch,
@@ -217,14 +229,14 @@ def run_dino_seg_heads(paths, ckpt, weights=WEIGHTS, device="cpu", epochs=50,
     return res
 
 
-def run_unet_seg(paths, device="cpu", unet_epochs=5, unet_batch=32, mlflow=True):
+def run_unet_seg(paths, device="cpu", unet_epochs=5, unet_batch=16, mlflow=True):
     """Train + validate the prod-like UNet BASELINE (trained Mega Model body + fresh head) on the
     aligned tiles + area split. Self-contained — NO DINO checkpoint needed (this chain stands on
     its own). `unet_epochs` is small (6000 samples/epoch). Logs to the MLflow comparison experiment.
     Needs aligned masks AND unet_config.json (epoch_file_key + activation:null)."""
     from src.evaluation.segmentation_compare import compare_unet
-    if not paths["masks"].exists():
-        print("[pipeline] no aligned masks — run align_annotations first; skipping UNet seg")
+    if not _has_aligned_tiles(paths):
+        print("[pipeline] no aligned tiles — run align_annotations first; skipping UNet seg")
         return None
     if not paths["model_config"].exists():
         print("[pipeline] no unet_config.json — skipping UNet seg")
@@ -235,6 +247,59 @@ def run_unet_seg(paths, device="cpu", unet_epochs=5, unet_batch=32, mlflow=True)
     return res
 
 
+# ── all post-training analysis for one site / many sites (NO download, NO train) ──────
+def run_site_analysis(paths, ckpt, device="cuda:1", epochs=50, unet_epochs=10, mlflow=True):
+    """Full per-site flow EXCEPT the unsupervised finetuning: data prep (download imagery +
+    annotations, align masks) then the post-training steps (visual analysis, annotated evaluation,
+    the 2 DINO seg heads, the UNet baseline). The finetuning is NEVER (re)done here — it reuses the
+    existing checkpoint and raises FileNotFoundError if it's missing (we don't silently retrain).
+    Every step self-skips when its own inputs are missing (no dataset.json -> no annotations/align;
+    no aligned masks -> eval/DINO/UNet skip and only visual analysis runs)."""
+    if not Path(ckpt).exists():
+        raise FileNotFoundError(f"no finetuned checkpoint at {ckpt} — finetune the site first; "
+                                f"this step never retrains")
+    # data prep — IDEMPOTENT: only fetch/align what's missing (download_grid re-writes every tile,
+    # so we guard on existing outputs to avoid re-pulling thousands of tiles from S3 each re-run).
+    if not any(paths["rgb"].rglob("*.tif")):                   # 1a) imagery absent -> download .tif tiles
+        download_imagery_tiles(paths)
+    if not paths["masks"].exists():                            # 1b+c) masks absent -> annotations + align
+        download_annotations(paths)                            #       (both self-skip if no dataset.json)
+        align_annotations(paths)
+    run_visual_analysis(paths, ckpt, device=device)            # 3) pretrained-vs-finetuned pictures
+    run_evaluation(paths, ckpt, device=device)                 # 4) cluster / confusion / probe (needs masks)
+    run_dino_seg_heads(paths, ckpt, device=device, epochs=epochs, mlflow=mlflow)   # 5a) DINO seg heads
+    run_unet_seg(paths, device=device, unet_epochs=unet_epochs, mlflow=mlflow)     # 5b) UNet baseline
+
+
+def run_all_sites(site_dirs, device="cuda:1", epochs=50, unet_epochs=10, mlflow=True):
+    """run_site_analysis over several sites — the unsupervised finetuning is NEVER (re)done here,
+    each site reuses its existing checkpoint (checkpoints/<site>/final.pt). FAILS FAST: if ANY site
+    lacks a finetuned checkpoint, raises FileNotFoundError listing them (no silent skip, no retrain)
+    before doing any work. Once past that gate, per-site analysis failures are isolated so one site
+    can't sink the rest. Prints a per-site summary at the end."""
+    import traceback
+    paths_by_site = {sd: site_paths(sd) for sd in site_dirs}
+    missing = [p["name"] for p in paths_by_site.values() if not p["ckpt"].exists()]
+    if missing:                                                # finetuned model unavailable -> error
+        raise FileNotFoundError(f"no finetuned checkpoint for: {', '.join(missing)} "
+                                f"(expected checkpoints/<site>/final.pt). Finetune those first — "
+                                f"this loop never retrains.")
+    summary = {}
+    for site_dir, paths in paths_by_site.items():
+        print(f"\n{'=' * 22} {paths['name']} {'=' * 22}", flush=True)
+        try:
+            run_site_analysis(paths, paths["ckpt"], device=device, epochs=epochs,
+                              unet_epochs=unet_epochs, mlflow=mlflow)
+            summary[paths["name"]] = "ok"
+        except Exception:                                      # isolate: one site's failure ≠ all
+            traceback.print_exc()
+            summary[paths["name"]] = "FAILED"
+    print("\n=== summary ===")
+    for name, status in summary.items():
+        print(f"  {name:28s} {status}")
+    return summary
+
+
 # ════════════════════════════════════════════════════════════════════════════════════
 #  RUN — pick a SITE config, then run the lines below one at a time (Shift+Enter).
 #  cheap -> expensive: prep -> train (GPU) -> analyse/eval (cached after 1st pass).
@@ -243,13 +308,13 @@ if __name__ == "__main__":
     # --- choose ONE site ---
     
     CONFIG = {
-        #"site_dir": "input_site_data/EM2020_Jimblebar_Rail",
-        "site_dir": "input_site_data/manned_bens_oasis_wet",
+        "site_dir": "input_site_data/EM2020_Jimblebar_Rail",
+        #"site_dir": "input_site_data/manned_bens_oasis_wet",
         #"site_dir": "input_site_data/monrovia",
         # 50 epochs, MLflow on (experiment 'dino_lora_finetune'), checkpoint every 10 epochs
-       "train": dict(epochs=50, n_local=4, batch_size=2, grad_accum=4,
+        "train": dict(epochs=50, n_local=4, batch_size=2, grad_accum=4,
                       max_steps=None, save_every_epochs=10, mlflow=True),
-        "device": "cpu",                                   # analysis/eval (cached -> cpu is fine)
+        "device": "cuda:1",                                   # analysis/eval (cached -> cpu is fine)
     }
 
     paths = site_paths(CONFIG["site_dir"])
@@ -257,6 +322,17 @@ if __name__ == "__main__":
     download_imagery_tiles(paths)                           # 1a) .tif tiles for training + viz
     download_annotations(paths)                             # 1b) npz annotations
     align_annotations(paths)                                # 1c) realign npz masks onto the .tif imagery grid
+
+    # ── eyeball the data (optional) — viz helpers straight from tytonai_utils ──────────
+    # from tytonai_utils.viz import plot_image_mask_pairs, plot_image_mask_tiles
+    # from tytonai_utils.rollup import CLASS_NAMES                 # {raw id -> name} for the legend
+    # after 1b) — raw manifest .npz pairs (imagery + CLASSIFY mask, BEFORE re-tiling):
+    # plot_image_mask_pairs(paths["annotations"], paths["dataset"], n=6,
+    #                       class_names=CLASS_NAMES, out_png=paths["out"] / "annot_pairs.png")
+    # after 1c) — grid-aligned .tif tiles (imagery tile_NNNNN.tif <-> mask tile_NNNNN.tif):
+    # area = Path(json.loads(paths["site_config"].read_text())["fgbs"][0]).stem
+    # plot_image_mask_tiles(paths["rgb"] / area, paths["masks"] / area, n=6,
+    #                       class_names=CLASS_NAMES, out_png=paths["out"] / "aligned_tiles.png")
 
     ckpt = train_site(paths, **CONFIG["train"])            # 2) finetune -> checkpoints/<site>/{epoch010..050,final}.pt
     ckpt = paths["ckpt"]
@@ -266,4 +342,15 @@ if __name__ == "__main__":
     run_evaluation(paths, ckpt, device=CONFIG["device"])        # 4) cluster / confusion / probe on aligned tiles
     run_dino_seg_heads(paths, ckpt, device="cuda:1", epochs=50)        # 5a) 2 DINO seg heads (cheap, cached -> MLflow)
     run_unet_seg(paths, device="cuda:1", unet_epochs=10)               # 5b) prod-like UNet baseline (standalone -> MLflow)
+
+    # ── OR: relaunch the analysis for ALL sites at once, NO download / NO training ─────
+    #  Uses each site's existing checkpoint. Sites without aligned masks (curepto, EM2020)
+    #  run visual analysis only; the eval / DINO / UNet steps self-skip for them.
+    SITES = [
+        #"input_site_data/curepto_chile",
+        "input_site_data/EM2020_Jimblebar_Rail",
+        "input_site_data/manned_bens_oasis_wet",
+        "input_site_data/monrovia",
+    ]
+    run_all_sites(SITES, device="cuda:1", epochs=50, unet_epochs=10)
 

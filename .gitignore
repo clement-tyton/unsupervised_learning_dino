@@ -14,8 +14,7 @@ input_site_data/**/annotations/
 input_site_data/**/masks/
 outputs/
 checkpoints/
-monrovia_exp/
-manned_bens_oasis_exp/
+exp/
 model_weight/
 
 # scratch / backups

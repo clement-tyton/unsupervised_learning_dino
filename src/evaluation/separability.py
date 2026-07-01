@@ -21,7 +21,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 from sklearn.cluster import KMeans
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import adjusted_rand_score, confusion_matrix, normalized_mutual_info_score
 from sklearn.metrics.cluster import contingency_matrix
 from sklearn.model_selection import train_test_split
@@ -327,6 +326,30 @@ def _split_groups(masks, split):
     return np.arange(len(masks)), "tile"
 
 
+def _probe_fit_predict(X, y, tr, te, seed, sub=50_000, batch=20_000, passes=5):
+    """Memory-bounded linear probe: streaming logistic regression via SGDClassifier(log-loss) +
+    partial_fit. Standardization stats come from a `sub`-patch subsample, and both fit and predict
+    run one `batch`-sized slice at a time — so the full standardized matrix is NEVER materialized
+    (peak RAM = one batch, not the whole train set, regardless of site size). It's a separability
+    CHECK, not a tuned model, so the SGD approximation of logistic regression is fine.
+    Returns (yp aligned with np.where(te)[0], classes)."""
+    from sklearn.linear_model import SGDClassifier
+    rng = np.random.default_rng(seed)
+    tr_i, te_i = np.where(tr)[0], np.where(te)[0]
+    ssub = rng.choice(tr_i, min(sub, len(tr_i)), replace=False)   # scaler stats from a bounded subsample
+    scaler = StandardScaler().fit(X[ssub])
+    classes = np.unique(y)
+    clf = SGDClassifier(loss="log_loss", alpha=1e-4, random_state=seed)
+    for _ in range(passes):                                       # a few streaming epochs
+        rng.shuffle(tr_i)
+        for i in range(0, len(tr_i), batch):                     # one standardized batch in RAM at a time
+            b = tr_i[i:i + batch]
+            clf.partial_fit(scaler.transform(X[b]), y[b], classes=classes)
+    yp = (np.concatenate([clf.predict(scaler.transform(X[te_i[i:i + batch]]))
+                          for i in range(0, len(te_i), batch)]) if len(te_i) else np.array([], int))
+    return yp, classes
+
+
 def linear_probe_confusion(weights, ckpt, rgb_root, masks_root, model="finetuned",
                            img_size=512, ignore=(0,), device="cpu", out_png=None, seed=0,
                            max_tiles=None, test_frac=0.3, split="area"):
@@ -354,12 +377,10 @@ def linear_probe_confusion(weights, ckpt, rgb_root, masks_root, model="finetuned
         gtr, gte = np.unique(gid[tr]), np.unique(gid[te])
     else:                                                         # hold out whole groups (area/tile)
         tr, te, gtr, gte = _tile_split(gid, test_frac, seed)
-    scaler = StandardScaler().fit(X[tr])
-    clf = LogisticRegression(max_iter=400, C=1.0).fit(scaler.transform(X[tr]), y[tr])
-    yp = clf.predict(scaler.transform(X[te]))
-    acc = float((yp == y[te]).mean())
-    classes = np.unique(y)
-    cm = confusion_matrix(y[te], yp, labels=classes, normalize="true")
+    yp, classes = _probe_fit_predict(X, y, tr, te, seed)          # streaming SGD log-loss -> flat RAM
+    y_te = y[te]
+    acc = float((yp == y_te).mean()) if len(yp) else 0.0
+    cm = confusion_matrix(y_te, yp, labels=classes, normalize="true")
     print(f"{model} linear probe ({split} split): acc {acc:.3f} | "
           f"{len(gtr)} train / {len(gte)} val {unit}s, {te.sum()} val patches")
     for c, row in zip(classes, cm):

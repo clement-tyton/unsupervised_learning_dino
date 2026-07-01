@@ -130,13 +130,41 @@ def class_weights(targets, tr_idx, K1):
     return torch.from_numpy(w)
 
 
+def class_pixel_counts(targets, tr_idx, K1):
+    """Per-real-class pixel count over the annotated TRAIN tiles (index 0 = ignore, dropped).
+    This is the absolute training signal per class behind the macro-F1: a class with very few
+    pixels is the one that drags the macro mean down (or comes out NaN in a fold with no val
+    pixels). Train only (no val) — it describes what the models actually learned from."""
+    import numpy as np
+    cnt = np.bincount(targets[tr_idx].numpy().ravel(), minlength=K1).astype(float)
+    return cnt[1:]                                                # real classes only (drop ignore)
+
+
 # ── DINO head training (on FROZEN cached features — fast) ───────────────────────────
+def _aug_feats(xb, yb, g):
+    """One random dihedral transform (rot90^k + optional H-flip) applied IDENTICALLY to the patch
+    tokens (reshaped to their g×g grid, same layout ConvSegHead uses) and to the (B,H,W) label.
+    Recovers the UNet's flip augmentation for the frozen head at ~zero cost (pure tensor ops on
+    cached features — the backbone never runs). ViT features aren't perfectly flip-equivariant, so
+    it acts as regularization rather than an exact symmetry — which is what a 1.5M head on ~90
+    tiles needs. Returns (tokens (B,N,D), label (B,H,W))."""
+    B, N, D = xb.shape
+    x = xb.transpose(1, 2).reshape(B, D, g, g)                  # tokens -> grid (matches ConvSegHead)
+    k = int(torch.randint(0, 4, (1,)))
+    x, yb = torch.rot90(x, k, (2, 3)), torch.rot90(yb, k, (1, 2))
+    if torch.rand(1) < 0.5:
+        x, yb = x.flip(3), yb.flip(2)                           # grid width <-> label width
+    return x.reshape(B, D, N).transpose(1, 2).contiguous(), yb.contiguous()
+
+
 def train_dino_head(feats, targets, tr_idx, K1, device="cpu", epochs=30, lr=1e-3,
-                    batch_size=4, class_weight=None, seed=0):
+                    batch_size=4, class_weight=None, seed=0, aug=True):
     """Train a fresh ConvSegHead on FROZEN features `feats` (T,N,D) -> full-res logits, against
     the remapped `targets` (T,out,out), with class-weighted CrossEntropyLoss(ignore_index=0). The
-    ViT backbone never runs (features are cached), so this is cheap. Times ONLY the optimization
-    loop. Returns (head, {train_time_s, loss_curve, final_loss, n_params, n_train})."""
+    ViT backbone never runs (features are cached), so this is cheap. `aug` adds feature-space
+    dihedral augmentation (the frozen-head analog of the UNet's flips — see _aug_feats), still
+    seconds/epoch. Times ONLY the optimization loop. Returns (head, {train_time_s, loss_curve,
+    final_loss, n_params, n_train})."""
     torch.manual_seed(seed)
     head = ConvSegHead(in_dim=feats.shape[-1], n_classes=K1).to(device)
     opt = torch.optim.AdamW(head.parameters(), lr=lr)
@@ -154,6 +182,8 @@ def train_dino_head(feats, targets, tr_idx, K1, device="cpu", epochs=30, lr=1e-3
         for i in range(0, n, batch_size):
             b = perm[i:i + batch_size]
             xb, yb = Xtr[b].to(device), Ytr[b].to(device)
+            if aug:
+                xb, yb = _aug_feats(xb, yb, head.g)             # feature-space flip/rotate (cheap)
             loss = ce(head(xb), yb)
             opt.zero_grad(); loss.backward(); opt.step()
             total += loss.item() * len(b)
@@ -191,6 +221,8 @@ def _log_seg_run(site, scenario, metrics, config, experiment=SEG_EXPERIMENT, tra
             for nm, v in metrics.get("per_f1", {}).items():     # per-class F1 (skip NaN classes)
                 if not (isinstance(v, float) and math.isnan(v)):
                     scalars[f"f1/{nm.replace(' ', '_')}"] = v    # MLflow-safe metric key
+            for nm, v in metrics.get("train_px_M", {}).items():  # per-class train pixels (millions)
+                scalars[f"train_px_M/{nm.replace(' ', '_')}"] = v
             run.log(scalars)
         print(f"    logged -> mlflow[{experiment}] {site}__{scenario}")
     except Exception as e:
@@ -218,6 +250,14 @@ def _fmt_per_class(per_f1, names):
                       for n, f in zip(names[1:], per_f1))
 
 
+def _fmt_train_balance(counts, names):
+    """'Ground 12.34M (62.4%) · Sedge 0.03M (0.3%)' — per-class train pixels in millions (2 dp)
+    with the share in %, over the K real classes (names[1:])."""
+    tot = sum(counts) or 1.0
+    return " · ".join(f"{n} {c / 1e6:.2f}M ({100 * c / tot:.1f}%)"
+                      for n, c in zip(names[1:], counts))
+
+
 @torch.no_grad()
 def _eval_seg(predict, te_idx, targets, K1):
     """Accumulate the (K1,K1) confusion over the val tiles and score it. predict(idx) -> (H,W)
@@ -232,41 +272,65 @@ def _eval_seg(predict, te_idx, targets, K1):
     return seg_scores(cm, K1)
 
 
-def eval_head(head, feats, targets, te_idx, K1, device="cpu"):
-    """Validate a trained ConvSegHead on the val tiles -> (per_f1, macro_f1, pix_acc)."""
+@torch.no_grad()
+def _tta_logits(head, x):
+    """Test-time augmentation: mean logits over the 4 flips (id, H, V, HV). Flip the feature grid,
+    run the head, flip the logits back to the original frame, average. Head-only (no backbone), so
+    it's nearly free and gives a small, consistent macro-F1 bump. x is (1,N,D)."""
+    B, N, D = x.shape
+    g = head.g
+    xm = x.transpose(1, 2).reshape(B, D, g, g)                  # tokens -> grid
+    acc = None
+    for dims in ((), (3,), (2,), (2, 3)):                       # grid dims 2/3 == output H/W
+        xf = torch.flip(xm, dims) if dims else xm
+        lf = head(xf.reshape(B, D, N).transpose(1, 2).contiguous())      # (1,K1,512,512), flipped frame
+        lf = torch.flip(lf, dims) if dims else lf               # un-flip back to the original frame
+        acc = lf if acc is None else acc + lf
+    return acc
+
+
+def eval_head(head, feats, targets, te_idx, K1, device="cpu", tta=True):
+    """Validate a trained ConvSegHead on the val tiles -> (per_f1, macro_f1, pix_acc). `tta`
+    flip-averages the logits (see _tta_logits) — cheap, no backbone, small consistent gain."""
     head.eval()
 
     def predict(idx):
-        return head(feats[idx:idx + 1].to(device)).argmax(1)[0].cpu().numpy()
+        x = feats[idx:idx + 1].to(device)
+        logits = _tta_logits(head, x) if tta else head(x)
+        return logits.argmax(1)[0].cpu().numpy()
     return _eval_seg(predict, te_idx, targets, K1)
 
 
-def eval_unet(model, imgs, targets, te_idx, K1, device="cpu", img_size=512):
-    """Validate a trained UNet on the val tiles -> (per_f1, macro_f1, pix_acc)."""
-    from src.visualisation.common import _embed_tensor
+def eval_unet(model, imgs, targets, te_idx, K1, model_config, device="cpu", img_size=512):
+    """Validate a trained UNet on the val tiles -> (per_f1, macro_f1, pix_acc). Uses the SAME
+    preprocessing as train_unet (_rgb_raw + site-stat Normalize, no augmentation) so the train and
+    eval input distributions can't diverge — a mismatch there silently tanks val F1."""
+    import albumentations as albu
+    from albumentations.pytorch import ToTensorV2
+    from tytonai_utils.model import read_model_config
+    cfg = read_model_config(model_config)["config"]
+    norm = albu.Compose([albu.Normalize(mean=cfg["train_mean"], std=cfg["train_std"],
+                                        max_pixel_value=1.0), ToTensorV2()])   # identical to training
     model.eval()
 
     def predict(idx):
-        x = _embed_tensor(imgs[idx], img_size)[None].to(device)
+        x = norm(image=_rgb_raw(imgs[idx], img_size))["image"][None].to(device)
         return model(x).argmax(1)[0].cpu().numpy()
     return _eval_seg(predict, te_idx, targets, K1)
 
 
 # ── shared setup (same tiles, features, targets and area split for EVERY model) ─────
-def _prepare(weights, ckpt, rgb_root, masks_root, device, img_size, test_frac, seed):
-    """Aligned pairs (+drop small), frozen DINO features (pre/ft), remapped targets, and the
-    honest area split — identical for every model so the comparison is apples-to-apples."""
+def _prepare_data(rgb_root, masks_root, img_size, test_frac, seed):
+    """Model-AGNOSTIC base shared by every segmentation run: aligned image/mask pairs (small ones
+    dropped), the data-driven class space, the remapped targets, and the honest area-level split.
+    No model, no DINO, no UNet — both the DINO heads and the UNet baseline build on this, so they
+    score the SAME tiles on the SAME split. Safe to reuse on its own for any new seg model."""
     import numpy as np
-    from src.evaluation.separability import (EVAL_CACHE, _area_index, _drop_small, _tile_split,
-                                             aligned_pairs)
-    from src.visualisation.common import _embed_tensor
-    from src.visualisation.features import pre_ft_features
+    from src.evaluation.separability import (_area_index, _drop_small, _tile_split, aligned_pairs)
     imgs, masks = aligned_pairs(rgb_root, masks_root)
     imgs, masks = _drop_small(imgs, masks, img_size // 16)
     ids, id2idx, names = class_mapping(masks_root)
     K1 = len(ids) + 1
-    (pre, _), (ft, _), g = pre_ft_features(weights, ckpt, imgs, device, img_size,
-                                           EVAL_CACHE, _embed_tensor)
     targets = build_targets(masks, id2idx, out_size=img_size)
     area_idx, n_areas = _area_index(masks)
     tr_mask, te_mask, tr_groups, te_groups = _tile_split(area_idx, test_frac, seed)
@@ -274,7 +338,19 @@ def _prepare(weights, ckpt, rgb_root, masks_root, device, img_size, test_frac, s
     print(f"{len(imgs)} tiles | train {len(tr_idx)} / val {len(te_idx)} | areas {n_areas} "
           f"({len(tr_groups)} train / {len(te_groups)} val) | K1={K1}")
     return dict(imgs=imgs, masks=masks, targets=targets, tr_idx=tr_idx, te_idx=te_idx,
-                ids=ids, id2idx=id2idx, names=names, K1=K1, pre=pre, ft=ft)
+                ids=ids, id2idx=id2idx, names=names, K1=K1)
+
+
+def _dino_features(weights, ckpt, imgs, device, img_size):
+    """DINO-ONLY: the frozen PRETRAINED and FINETUNED patch features for the ConvSegHeads (cached
+    in EVAL_CACHE). Kept apart from _prepare_data so the UNet baseline never triggers a backbone
+    pass. Returns (pre, ft)."""
+    from src.evaluation.separability import EVAL_CACHE
+    from src.visualisation.common import _embed_tensor
+    from src.visualisation.features import pre_ft_features
+    (pre, _), (ft, _), _ = pre_ft_features(weights, ckpt, imgs, device, img_size,
+                                           EVAL_CACHE, _embed_tensor)
+    return pre, ft
 
 
 # ── UNet end-to-end training (whole net runs; reuses the trained Mega Model weights) ──
@@ -304,16 +380,29 @@ def _rgb512(path, size=512):
     return np.array(Image.fromarray(_tif_rgb(path)).resize((size, size)))
 
 
+def _rgb_raw(path, size=512):
+    """(size,size,3) uint8 RGB read straight from bands [1,2,3] with NO per-band stretch, then
+    resized. Pixels stay on the native 0–255 scale the prod model's train_mean/train_std were
+    computed on — so (px - train_mean)/train_std reproduces the production normalization."""
+    import numpy as np
+    import rasterio
+    from PIL import Image
+    with rasterio.open(path) as src:
+        arr = src.read([1, 2, 3]).transpose(1, 2, 0).astype("uint8")   # (H,W,3), native 0–255
+    return np.array(Image.fromarray(arr).resize((size, size)))
+
+
 def train_unet(imgs, targets, tr_idx, model_config, K1, device="cpu", epochs=30, lr=1e-3,
-               batch_size=32, grad_accum=8, samples_per_epoch=6000, crop=256, balance=True,
+               batch_size=16, grad_accum=16, samples_per_epoch=6000, crop=None, balance=False,
                class_weight=None, weights_dir="model_weight/unet", seed=0):
-    """Prod-like UNet fine-tune (mirrors object_train's recipe, kept SINGLE-LABEL for the
-    comparison): trained Mega Model encoder+decoder + fresh head (NOT frozen); data_balance
-    oversampling of the train tiles; albumentations augmentation (random crop + H/V flips, like
-    object_train); micro-batch `batch_size` with gradient accumulation `grad_accum` (effective
-    batch = batch*accum); `samples_per_epoch` random draws/epoch from the balanced pool; bf16
-    autocast; class-weighted CE(ignore_index=0) — SAME loss/eval as the DINO heads.
-    Returns (model, metrics)."""
+    """UNet fine-tune: trained Mega Model encoder+decoder + fresh head (NOT frozen). By DEFAULT it
+    now trains on FULL 512 tiles (crop=None) with NO data_balance (balance=False) — same data the
+    DINO heads see, for a clean comparison. Augmentation = H/V flips (+ optional RandomCrop if
+    `crop` is set); micro-batch `batch_size` with grad accumulation `grad_accum` (effective batch =
+    batch*accum = 16*16 = 256); `samples_per_epoch` random draws/epoch; bf16 autocast; class-weighted
+    CE(ignore_index=0) — SAME loss/eval as the DINO heads. NOTE: full 512 is memory-heavy (~10 GB at
+    batch 16); drop to batch 8 / grad_accum 32 if you OOM, or set crop=256/balance=True for the
+    prod-like recipe. Returns (model, metrics)."""
     import albumentations as albu
     import numpy as np
     from albumentations.pytorch import ToTensorV2
@@ -321,12 +410,12 @@ def train_unet(imgs, targets, tr_idx, model_config, K1, device="cpu", epochs=30,
     from tytonai_utils.model import (download_model_weights_from_config,
                                      load_model_with_fresh_head_from_config, read_model_config)
     load_dotenv(".env", override=True)                          # AWS creds for the weights download
-    if "epoch_file_key" not in read_model_config(model_config):
+    cfg = read_model_config(model_config)
+    if "epoch_file_key" not in cfg:
         raise KeyError("model config needs 'epoch_file_key' (s3://...pth) — rename your "
                        "'epoch_v2_file_key' to 'epoch_file_key'.")
+    mean, std = cfg["config"]["train_mean"], cfg["config"]["train_std"]   # prod normalization stats
     torch.manual_seed(seed)
-    cfg = read_model_config(model_config)["config"]               # site stats the body was trained on
-    mean, std = cfg["train_mean"], cfg["train_std"]
     wpath = download_model_weights_from_config(model_config, weights_dir)
     model = load_model_with_fresh_head_from_config(model_config, wpath, num_classes=K1,
                                                    freeze_encoder=False).to(device)
@@ -337,11 +426,12 @@ def train_unet(imgs, targets, tr_idx, model_config, K1, device="cpu", epochs=30,
     ce = nn.CrossEntropyLoss(weight=cw, ignore_index=0)
 
     pool = _balance_pool(targets, tr_idx, K1, seed) if balance else np.asarray(tr_idx)
-    rgb = {int(j): _rgb512(imgs[j]) for j in np.unique(pool)}    # cache (512,512,3) RGB per used tile
-    aug = albu.Compose([albu.RandomCrop(crop, crop), albu.HorizontalFlip(p=0.5),
-                        albu.VerticalFlip(p=0.5),
-                        albu.Normalize(mean=mean, std=std, max_pixel_value=1.0),  # site stats (0–255)
-                        ToTensorV2()])
+    rgb = {int(j): _rgb_raw(imgs[j]) for j in np.unique(pool)}   # cache raw (512,512,3) RGB per used tile
+    tf = [albu.RandomCrop(crop, crop)] if crop else []          # crop=None -> full 512 tile (parity w/ DINO heads)
+    tf += [albu.HorizontalFlip(p=0.5), albu.VerticalFlip(p=0.5),
+           albu.Normalize(mean=mean, std=std, max_pixel_value=1.0),   # prod site stats — MUST match eval_unet
+           ToTensorV2()]
+    aug = albu.Compose(tf)
     amp = "cuda" in str(device)
     steps = samples_per_epoch // batch_size
     model.train(); curve = []; t0 = time.perf_counter()
@@ -376,10 +466,11 @@ def train_dino_heads(weights, ckpt, rgb_root, masks_root, device="cpu", img_size
     honest area split. Reports macro-F1 / per-class F1 / pixel-acc per variant; with mlflow=True
     logs each to `experiment` (one run per variant, same server). Returns ({variant: (head, metrics)}, split)."""
     site = site or Path(rgb_root).parent.name                    # e.g. .../monrovia/RGB -> "monrovia"
-    d = _prepare(weights, ckpt, rgb_root, masks_root, device, img_size, test_frac, seed)
+    d = _prepare_data(rgb_root, masks_root, img_size, test_frac, seed)
+    pre, ft = _dino_features(weights, ckpt, d["imgs"], device, img_size)
     cw = class_weights(d["targets"], d["tr_idx"], d["K1"])       # one balanced loss for both heads
     res = {}
-    for name, feats in [("pretrained", d["pre"]), ("finetuned", d["ft"])]:
+    for name, feats in [("pretrained", pre), ("finetuned", ft)]:
         head, m = train_dino_head(feats, d["targets"], d["tr_idx"], d["K1"], device, epochs,
                                   batch_size=batch_size, class_weight=cw, seed=seed)
         per_f1, m["val_f1"], m["val_pixel_acc"] = eval_head(head, feats, d["targets"], d["te_idx"],
@@ -398,48 +489,111 @@ def train_dino_heads(weights, ckpt, rgb_root, masks_root, device="cpu", img_size
                      id2idx=d["id2idx"], names=d["names"])
 
 
-def compare_segmentation(weights, ckpt, rgb_root, masks_root, model_config, device="cpu",
-                         img_size=512, epochs=50, unet_epochs=5, dino_batch=4, unet_batch=32,
-                         test_frac=0.3, seed=0, mlflow=False, site=None, experiment=SEG_EXPERIMENT):
-    """Train + VALIDATE all THREE models (DINO pretrained head, DINO finetuned head, UNet) on the
-    SAME aligned tiles and SAME area split. `epochs` is for the DINO heads (cheap, full passes over
-    the train tiles); `unet_epochs` is separate (the UNet does samples_per_epoch=6000 draws/epoch,
-    so far fewer epochs). Reports macro-F1 / per-class F1 / pixel-acc; with mlflow=True logs each as
-    a run in the comparison experiment. UNet is best-effort (needs S3 weights + 'epoch_file_key')."""
+def _split_info(d):
+    """The shared class-space + area-split descriptor every comparison run returns."""
+    return dict(tr_idx=d["tr_idx"], te_idx=d["te_idx"], ids=d["ids"],
+                id2idx=d["id2idx"], names=d["names"])
+
+
+def _finish_seg(res, names, site, mlflow, experiment, label, net, m, val, cfg, train_px_M=None):
+    """Attach validation scores to `m`, print the per-class summary, optionally log to MLflow,
+    and stash (net, m) under `label` in `res`. Shared by both comparison halves. `train_px_M` (the
+    per-class train pixels in millions, same for every model) is stashed on `m` so MLflow logs it."""
+    per_f1, m["val_f1"], m["val_pixel_acc"] = val
+    m["per_f1"] = dict(zip(names[1:], per_f1.tolist()))
+    if train_px_M is not None:
+        m["train_px_M"] = train_px_M
+    print(f"  {label:16s} {m['train_time_s']:6.1f}s | val F1 {m['val_f1']:.3f} "
+          f"pixAcc {m['val_pixel_acc']:.3f} | {m['n_params']/1e6:.2f}M params")
+    print(f"                   per-class F1: {_fmt_per_class(per_f1, names)}")
+    if mlflow:
+        _log_seg_run(site, f"seg_{label}", m, experiment=experiment, config=cfg)
+    res[label] = (net, m)
+
+
+def compare_dino_heads(weights, ckpt, rgb_root, masks_root, device="cpu", img_size=512,
+                       epochs=50, dino_batch=4, test_frac=0.3, seed=0, mlflow=False,
+                       site=None, experiment=SEG_EXPERIMENT):
+    """Train + VALIDATE an ABLATION LADDER of frozen-DINO ConvSegHeads on the aligned tiles + area
+    split: the 2 existing baselines (pretrained, finetuned) + 4 cheap upgrades — finetuned+aug,
+    finetuned+aug+TTA, the SAT493M⊕finetuned bundle, and bundle+aug+TTA. All run on cached features
+    (the backbone never runs), so every head still trains in seconds. Reports macro-F1 / per-class
+    F1 / pixel-acc; with mlflow=True logs one run per head so the incremental gains line up."""
     site = site or Path(rgb_root).parent.name
-    d = _prepare(weights, ckpt, rgb_root, masks_root, device, img_size, test_frac, seed)
-    cw = class_weights(d["targets"], d["tr_idx"], d["K1"])       # SAME balanced loss for all 3 models
+    d = _prepare_data(rgb_root, masks_root, img_size, test_frac, seed)
+    pre, ft = _dino_features(weights, ckpt, d["imgs"], device, img_size)
+    cw = class_weights(d["targets"], d["tr_idx"], d["K1"])       # balanced loss shared by all heads
+    counts = class_pixel_counts(d["targets"], d["tr_idx"], d["K1"])
+    px_M = dict(zip(d["names"][1:], (counts / 1e6).tolist()))    # {class: train pixels in millions}
+    print(f"  train pixels: {_fmt_train_balance(counts, d['names'])}")   # context for the macro-F1
+    # SAT493M-pretrained ⊕ finetuned features per patch (2048-d) — both already cached, so the
+    # bundle is nearly free (no backbone pass); the head just picks the best of each.
+    combo = torch.cat([pre, ft], dim=-1)
+    # Ablation ladder: the 2 existing baselines, then each cheap improvement isolated so its F1
+    # gain is readable in MLflow — (label, features, aug, tta). All train on cached features.
+    variants = [
+        ("dino_pretrained",        pre,   False, False),   # exists: SAT493M features, no tricks
+        ("dino_finetuned",         ft,    False, False),   # exists: finetuned features, no tricks
+        ("dino_finetuned_aug",     ft,    True,  False),   # + feature-space augmentation
+        ("dino_finetuned_aug_tta", ft,    True,  True),    # + augmentation + flip-TTA
+        ("dino_pre+ft",            combo, False, False),   # SAT493M ⊕ finetuned bundle, no tricks
+        ("dino_pre+ft_aug_tta",    combo, True,  True),    # bundle + augmentation + flip-TTA
+    ]
     res = {}
-
-    def _finish(label, net, m, val, cfg):
-        per_f1, m["val_f1"], m["val_pixel_acc"] = val
-        m["per_f1"] = dict(zip(d["names"][1:], per_f1.tolist()))
-        print(f"  {label:16s} {m['train_time_s']:6.1f}s | val F1 {m['val_f1']:.3f} "
-              f"pixAcc {m['val_pixel_acc']:.3f} | {m['n_params']/1e6:.2f}M params")
-        print(f"                   per-class F1: {_fmt_per_class(per_f1, d['names'])}")
-        if mlflow:
-            _log_seg_run(site, f"seg_{label}", m, experiment=experiment, config=cfg)
-        res[label] = (net, m)
-
-    for label, feats in [("dino_pretrained", d["pre"]), ("dino_finetuned", d["ft"])]:
+    for label, feats, aug, tta in variants:
         head, m = train_dino_head(feats, d["targets"], d["tr_idx"], d["K1"], device, epochs,
-                                  batch_size=dino_batch, class_weight=cw, seed=seed)
-        val = eval_head(head, feats, d["targets"], d["te_idx"], d["K1"], device)
-        _finish(label, head, m, val, dict(model=label, epochs=epochs, lr=1e-3,
-                                          batch_size=dino_batch, test_frac=test_frac, seed=seed, K1=d["K1"]))
+                                  batch_size=dino_batch, class_weight=cw, seed=seed, aug=aug)
+        val = eval_head(head, feats, d["targets"], d["te_idx"], d["K1"], device, tta=tta)
+        _finish_seg(res, d["names"], site, mlflow, experiment, label, head, m, val,
+                    dict(model=label, epochs=epochs, lr=1e-3, batch_size=dino_batch,
+                         test_frac=test_frac, seed=seed, K1=d["K1"], aug=aug, tta=tta),
+                    train_px_M=px_M)
+    return res, _split_info(d)
 
+
+def compare_unet(rgb_root, masks_root, model_config, device="cpu", img_size=512,
+                 unet_epochs=5, unet_batch=16, test_frac=0.3, seed=0, mlflow=False,
+                 site=None, experiment=SEG_EXPERIMENT):
+    """Train + VALIDATE the prod-like UNet BASELINE (trained Mega Model body + fresh head) on the
+    aligned tiles + area split. Fully self-contained — NO DINO weights/features, so this chain
+    stands alone and can be reused for other UNet work. Needs the S3 weights + 'epoch_file_key' in
+    `model_config`. Same data/split/loss as compare_dino_heads (deterministic), so it stays
+    apples-to-apples. Reports macro-F1 / per-class F1 / pixel-acc; logs one run if mlflow=True."""
+    site = site or Path(rgb_root).parent.name
+    
+    # rgb_root, masks_root, model_config = paths["rgb"], paths["masks"], paths["model_config"]
+    # site  = paths["site"]
+    
+    d = _prepare_data(rgb_root, masks_root, img_size, test_frac, seed)
+    cw = class_weights(d["targets"], d["tr_idx"], d["K1"])
+    counts = class_pixel_counts(d["targets"], d["tr_idx"], d["K1"])
+    px_M = dict(zip(d["names"][1:], (counts / 1e6).tolist()))    # {class: train pixels in millions}
+    print(f"  train pixels: {_fmt_train_balance(counts, d['names'])}")   # context for the macro-F1
+    res = {}
+    model, m = train_unet(d["imgs"], d["targets"], d["tr_idx"], model_config, d["K1"],
+                          device, unet_epochs, batch_size=unet_batch, class_weight=cw, seed=seed)
+    val = eval_unet(model, d["imgs"], d["targets"], d["te_idx"], d["K1"], model_config, device, img_size)
+    _finish_seg(res, d["names"], site, mlflow, experiment, "unet", model, m, val,
+                dict(model="unet_megamodel_freshhead", epochs=unet_epochs, lr=1e-3,
+                     batch_size=unet_batch, test_frac=test_frac, seed=seed, K1=d["K1"]), train_px_M=px_M)
+    return res, _split_info(d)
+
+
+def compare_segmentation(weights, ckpt, rgb_root, masks_root, model_config, device="cpu",
+                         img_size=512, epochs=50, unet_epochs=5, dino_batch=4, unet_batch=16,
+                         test_frac=0.3, seed=0, mlflow=False, site=None, experiment=SEG_EXPERIMENT):
+    """Convenience wrapper: run BOTH halves (the two DINO heads, then the UNet) on the same split.
+    The UNet is best-effort (skipped if its S3 weights / 'epoch_file_key' are unavailable). Prefer
+    calling compare_dino_heads / compare_unet directly when you want them independently."""
+    res, split = compare_dino_heads(weights, ckpt, rgb_root, masks_root, device, img_size,
+                                    epochs, dino_batch, test_frac, seed, mlflow, site, experiment)
     try:                                                         # UNet — heavier, best-effort
-        model, m = train_unet(d["imgs"], d["targets"], d["tr_idx"], model_config, d["K1"],
-                              device, unet_epochs, batch_size=unet_batch, class_weight=cw, seed=seed)
-        val = eval_unet(model, d["imgs"], d["targets"], d["te_idx"], d["K1"], device, img_size)
-        _finish("unet", model, m, val, dict(model="unet_megamodel_freshhead", epochs=unet_epochs,
-                                            lr=1e-4, batch_size=unet_batch, test_frac=test_frac,
-                                            seed=seed, K1=d["K1"]))
+        ures, _ = compare_unet(rgb_root, masks_root, model_config, device, img_size,
+                               unet_epochs, unet_batch, test_frac, seed, mlflow, site, experiment)
+        res.update(ures)
     except Exception as e:
         print(f"  unet skipped ({type(e).__name__}: {e})")
-
-    return res, dict(tr_idx=d["tr_idx"], te_idx=d["te_idx"], ids=d["ids"],
-                     id2idx=d["id2idx"], names=d["names"])
+    return res, split
 
 
 # ════════════════════════════════════════════════════════════════════════════════════

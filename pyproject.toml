@@ -16,7 +16,7 @@ dependencies = [
     "peft>=0.19.1",
     "mlflow==3.12.0",            # pinned to match object_train (the production UNet training activity)
     "scikit-learn>=1.9.0",
-    "tytonai_utils[webmap,s3,model]",
+    "tytonai_utils[webmap,s3,model,viz,s3,align,rollup]",
     "data_balance",
     "object_train"
 ]

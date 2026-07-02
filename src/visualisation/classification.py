@@ -86,11 +86,59 @@ def _combined_png(panels, extents, colors, names, out_png, dpi=200):
     return out_png
 
 
-def classification_maps(dino_preds, unet_preds, tiles, names, out_dir, dpi=200):
+def _colormap_255(names):
+    """Class-index -> (R,G,B,A) 0-255 color table for the GeoTIFF (so GIS shows colored classes).
+    Index 0 (ignore/no-data) -> fully transparent; 1..K -> the tab20 palette."""
+    colors = _class_palette(len(names))
+    cmap = {i: tuple(int(round(255 * c)) for c in colors[i]) for i in range(len(colors))}
+    cmap[0] = (*cmap[0][:3], 0)                                  # ignore -> transparent
+    return cmap
+
+
+def classification_geotiffs(preds, tiles, names, out_dir, label, merge=True):
+    """Write GEOREFERENCED single-band uint8 class rasters at NATIVE tile resolution: one GeoTIFF per
+    tile (same CRS/transform as the source imagery, class palette embedded as a color table), then —
+    if merge — mosaic them into one site-wide `map_<label>.tif`. Usable directly in QGIS/ArcGIS.
+    Returns the merged path (or the per-tile dir if merge=False)."""
+    import numpy as np
+    import rasterio
+    from PIL import Image
+    from rasterio.merge import merge as rio_merge
+    out_dir = Path(out_dir)
+    tdir = out_dir / f"tiles_{label}"; tdir.mkdir(parents=True, exist_ok=True)
+    cmap = _colormap_255(names)
+    written = []
+    for pred, tile in zip(preds, tiles):
+        with rasterio.open(tile) as src:
+            prof, h, w = src.profile.copy(), src.height, src.width
+        p = np.asarray(pred).astype("uint8")
+        if p.shape != (h, w):                                   # align pred grid to the tile's native grid
+            p = np.array(Image.fromarray(p).resize((w, h), Image.NEAREST))
+        prof.update(driver="GTiff", count=1, dtype="uint8", compress="lzw", nodata=0)
+        op = tdir / (Path(tile).stem + ".tif")
+        with rasterio.open(op, "w", **prof) as dst:
+            dst.write(p, 1)
+            dst.write_colormap(1, cmap)                         # embed class colors (GIS renders them)
+        written.append(op)
+    if not merge:
+        return tdir
+    with rasterio.open(written[0]) as s0:                       # site mosaic: one GeoTIFF for the whole site
+        meta = s0.meta.copy()
+    mosaic, transform = rio_merge([str(p) for p in written])
+    meta.update(height=mosaic.shape[1], width=mosaic.shape[2], transform=transform, compress="lzw")
+    site_path = out_dir / f"map_{label}.tif"
+    with rasterio.open(site_path, "w", **meta) as dst:
+        dst.write(mosaic)
+        dst.write_colormap(1, cmap)
+    return site_path
+
+
+def classification_maps(dino_preds, unet_preds, tiles, names, out_dir, dpi=200, geotiff=True):
     """Write the whole-site classification rasters: the finetuned-DINO map, the UNet map, a combined
-    side-by-side, and a shared legend. `*_preds` are per-tile (H,W) class-index maps aligned 1:1 with
-    `tiles` (pass None to skip a model); `names` is the class_mapping names (index 0 = ignore).
-    Returns {label: png_path} of everything written."""
+    side-by-side, and a shared legend (PNGs), plus — if geotiff — georeferenced native-res GeoTIFFs
+    per model (per-tile + a merged site-wide .tif, usable in GIS). `*_preds` are per-tile (H,W)
+    class-index maps aligned 1:1 with `tiles` (pass None to skip a model); `names` is the
+    class_mapping names (index 0 = ignore). Returns {label: path} of everything written."""
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     colors = _class_palette(len(names))
     extents = _tile_extents(tiles)                               # read geo bounds once, reuse everywhere
@@ -106,4 +154,9 @@ def classification_maps(dino_preds, unet_preds, tiles, names, out_dir, dpi=200):
         panels.append(("UNet baseline", unet_preds))
     if len(panels) == 2:                                         # the comparison the report is about
         out["combined"] = _combined_png(panels, extents, colors, names, out_dir / "map_compare.png", dpi)
+    if geotiff:                                                 # georeferenced native-res rasters for GIS
+        if dino_preds is not None:
+            out["dino_finetuned_tif"] = classification_geotiffs(dino_preds, tiles, names, out_dir, "dino_finetuned")
+        if unet_preds is not None:
+            out["unet_tif"] = classification_geotiffs(unet_preds, tiles, names, out_dir, "unet")
     return out

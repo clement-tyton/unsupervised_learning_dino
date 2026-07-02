@@ -33,6 +33,8 @@ def site_paths(site_dir) -> dict:
         "model_config": site_dir / "unet_config.json",     # smp UNet config (for the seg comparison)
         "out": Path("outputs") / site_dir.name,
         "ckpt": Path("checkpoints") / site_dir.name / "final.pt",
+        "dino_head_ckpt": Path("checkpoints") / site_dir.name / "dino_head_finetuned.pt",  # trained seg head
+        "unet_ckpt": Path("checkpoints") / site_dir.name / "unet_seg.pt",                  # trained UNet baseline
     }
 
 
@@ -219,13 +221,17 @@ def run_dino_seg_heads(paths, ckpt, weights=WEIGHTS, device="cpu", epochs=50,
     """Train + validate the two frozen-DINO ConvSegHeads (pretrained & finetuned) on the aligned
     tiles + honest area split. Cheap (cached features). Logs each head to the MLflow comparison
     experiment ('dino_segmentation_comparison'). Needs aligned masks (run align_annotations)."""
-    from src.evaluation.segmentation_compare import compare_dino_heads
+    from src.evaluation.segmentation_compare import compare_dino_heads, save_head_ckpt
     if not _has_aligned_tiles(paths):
         print("[pipeline] no aligned tiles — run align_annotations first; skipping DINO seg heads")
         return None
     res, split = compare_dino_heads(weights, ckpt, paths["rgb"], paths["masks"],
                                     device=device, epochs=epochs, dino_batch=dino_batch,
                                     mlflow=mlflow, site=paths["name"])
+    head = res.get("dino_finetuned", (None,))[0]               # persist the finetuned head (maps reuse it)
+    if head is not None:
+        save_head_ckpt(head, paths["dino_head_ckpt"], len(split["names"]))
+        print(f"[5a] saved finetuned DINO head -> {paths['dino_head_ckpt']}")
     return res
 
 
@@ -234,7 +240,7 @@ def run_unet_seg(paths, device="cpu", unet_epochs=5, unet_batch=16, mlflow=True)
     aligned tiles + area split. Self-contained — NO DINO checkpoint needed (this chain stands on
     its own). `unet_epochs` is small (6000 samples/epoch). Logs to the MLflow comparison experiment.
     Needs aligned masks AND unet_config.json (epoch_file_key + activation:null)."""
-    from src.evaluation.segmentation_compare import compare_unet
+    from src.evaluation.segmentation_compare import compare_unet, save_unet_ckpt
     if not _has_aligned_tiles(paths):
         print("[pipeline] no aligned tiles — run align_annotations first; skipping UNet seg")
         return None
@@ -244,6 +250,10 @@ def run_unet_seg(paths, device="cpu", unet_epochs=5, unet_batch=16, mlflow=True)
     res, split = compare_unet(paths["rgb"], paths["masks"], paths["model_config"],
                               device=device, unet_epochs=unet_epochs, unet_batch=unet_batch,
                               mlflow=mlflow, site=paths["name"])
+    model = res.get("unet", (None,))[0]                        # persist the trained UNet (maps reuse it, no retrain)
+    if model is not None:
+        save_unet_ckpt(model, paths["unet_ckpt"], len(split["names"]))
+        print(f"[5b] saved UNet -> {paths['unet_ckpt']}")
     return res
 
 
@@ -267,30 +277,37 @@ def run_classification_maps(paths, ckpt, weights=WEIGHTS, device="cpu", dino_res
     missing (the DINO head is cheap; the UNet is best-effort and skipped if it can't be sourced).
     Needs aligned masks (for the class space) + the .tif tiles."""
     from src.evaluation.segmentation_compare import (baseline_unet, class_mapping, finetuned_head,
-                                                     predict_dino_site, predict_unet_site)
+                                                     load_head_ckpt, load_unet_ckpt,
+                                                     predict_dino_site, predict_unet_site,
+                                                     save_head_ckpt, save_unet_ckpt)
     from src.visualisation.classification import classification_maps
     if not _has_aligned_tiles(paths):
         print("[pipeline] no aligned tiles — run align_annotations first; skipping classification maps")
         return None
     _, _, names = class_mapping(paths["masks"])                # shared contiguous class space (0=ignore)
-
-    # DINO finetuned head — reuse 5a's if handed in, else train just this one (cheap, cached feats)
+    # DINO finetuned head: passed-in (5a) > saved checkpoint > train just this one (cheap) then save
     head = dino_res.get("dino_finetuned", (None,))[0] if dino_res else None
+    if head is None and paths["dino_head_ckpt"].exists():
+        print(f"[maps] loading saved DINO head -> {paths['dino_head_ckpt']}")
+        head = load_head_ckpt(paths["dino_head_ckpt"], device)
     if head is None:
-        print("[maps] no DINO head passed — training the finetuned head")
+        print("[maps] no DINO head available — training the finetuned head")
         head, names = finetuned_head(weights, ckpt, paths["rgb"], paths["masks"],
                                      device=device, img_size=img_size, epochs=epochs)
-
-    # UNet — reuse 5b's if handed in, else train it (best-effort; needs unet_config + S3 weights)
+        save_head_ckpt(head, paths["dino_head_ckpt"], len(names))
+    # UNet: passed-in (5b) > saved checkpoint > train (best-effort; needs unet_config + S3 weights) then save
     unet = unet_res.get("unet", (None,))[0] if unet_res else None
+    if unet is None and paths["unet_ckpt"].exists() and paths["model_config"].exists():
+        print(f"[maps] loading saved UNet -> {paths['unet_ckpt']}")
+        unet = load_unet_ckpt(paths["model_config"], paths["unet_ckpt"], device)
     if unet is None and paths["model_config"].exists():
         try:
-            print("[maps] no UNet passed — training the baseline UNet")
+            print("[maps] no UNet available — training the baseline UNet")
             unet = baseline_unet(paths["rgb"], paths["masks"], paths["model_config"],
                                  device=device, img_size=img_size, unet_epochs=unet_epochs)
+            save_unet_ckpt(unet, paths["unet_ckpt"], len(names))
         except Exception as e:                                 # unavailable weights/config -> skip UNet panel
             print(f"[maps] UNet unavailable ({type(e).__name__}: {e}) — DINO map only")
-
     tiles = _site_tiles(paths)
     if not tiles:
         print("[maps] no full tiles found — skipping classification maps")
@@ -298,7 +315,6 @@ def run_classification_maps(paths, ckpt, weights=WEIGHTS, device="cpu", dino_res
     print(f"[maps] {paths['name']}: classifying {len(tiles)} site tiles on {device}")
     dino_preds = predict_dino_site(head, weights, ckpt, tiles, device, img_size) if head else None
     unet_preds = predict_unet_site(unet, paths["model_config"], tiles, device, img_size) if unet else None
-
     dst = _make_sections(paths["out"] / "report", ["06_classification_maps"])["06_classification_maps"]
     out = classification_maps(dino_preds, unet_preds, tiles, names, dst)
     print(f"[maps] {paths['name']}: {len([k for k in out if k != 'legend'])} maps -> {dst}")
@@ -368,7 +384,7 @@ if __name__ == "__main__":
     # --- choose ONE site ---
     
     CONFIG = {
-        "site_dir": "input_site_data/monrovia",
+        "site_dir": "input_site_data/manned_bens_oasis_wet",
         #"site_dir": "input_site_data/manned_bens_oasis_wet",
         #"site_dir": "input_site_data/monrovia",
         # 50 epochs, MLflow on (experiment 'dino_lora_finetune'), checkpoint every 10 epochs
@@ -405,6 +421,7 @@ if __name__ == "__main__":
     run_classification_maps(paths, ckpt, device="cuda:1",                    # 5c) whole-site maps (DINO-ft vs UNet, colored rasters)
                             dino_res=dino_res, unet_res=unet_res)
 
+
     # ── OR: relaunch the analysis for ALL sites at once, NO download / NO training ─────
     #  Uses each site's existing checkpoint. Sites without aligned masks (curepto, EM2020)
     #  run visual analysis only; the eval / DINO / UNet steps self-skip for them.
@@ -412,7 +429,8 @@ if __name__ == "__main__":
         # "input_site_data/curepto_chile",
         # "input_site_data/EM2020_Jimblebar_Rail",
         "input_site_data/manned_bens_oasis_wet",
-        "input_site_data/monrovia",
+        #"input_site_data/monrovia",
     ]
     run_all_sites(SITES, device="cuda:1", epochs=50, unet_epochs=10)
+
 

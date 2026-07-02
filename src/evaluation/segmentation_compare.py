@@ -322,16 +322,19 @@ def eval_unet(model, imgs, targets, te_idx, K1, model_config, device="cpu", img_
 
 # ── whole-site inference: run a TRAINED model over EVERY tile (not just val) ─────────
 @torch.no_grad()
-def predict_dino_site(head, weights, ckpt, tiles, device="cpu", img_size=512, tta=True):
-    """Per-tile (out,out) predicted class-index maps from the trained FINETUNED ConvSegHead over an
-    arbitrary tile list (the whole site, not just the val split). Same prediction path as eval_head
-    (optional flip-TTA), on the finetuned cached features. Returns a list of (out,out) int arrays
-    aligned 1:1 with `tiles`, in the contiguous class space (0 = ignore, 1..K = class_mapping)."""
-    _, ft = _dino_features(weights, ckpt, tiles, device, img_size)   # finetuned feats (pre dropped)
+def predict_dino_site(head, weights, ckpt, tiles, device="cpu", img_size=512, tta=True,
+                      variant="finetuned"):
+    """Per-tile (out,out) predicted class-index maps from a trained ConvSegHead over an arbitrary
+    tile list (the whole site, not just the val split). Same prediction path as eval_head (optional
+    flip-TTA). `variant` selects the features the head runs on — MUST match what it was trained on:
+    'finetuned' (default) = the finetuned features, 'pretrained' = the SAT pretrained features.
+    Returns a list of (out,out) int arrays aligned 1:1 with `tiles` (0 = ignore, 1..K = class_mapping)."""
+    pre, ft = _dino_features(weights, ckpt, tiles, device, img_size)
+    feats = ft if variant == "finetuned" else pre
     head.eval()
     preds = []
     for i in range(len(tiles)):
-        x = ft[i:i + 1].to(device)
+        x = feats[i:i + 1].to(device)
         logits = _tta_logits(head, x) if tta else head(x)
         preds.append(logits.argmax(1)[0].cpu().numpy())
     return preds
@@ -379,6 +382,49 @@ def baseline_unet(rgb_root, masks_root, model_config, device="cpu", img_size=512
     model, _ = train_unet(d["imgs"], d["targets"], d["tr_idx"], model_config, d["K1"], device,
                           unet_epochs, batch_size=unet_batch, class_weight=cw, seed=seed)
     return model
+
+
+# ── checkpoint save/load: persist the trained seg models so the maps never retrain ──
+def save_head_ckpt(head, path, K1):
+    """Persist a trained ConvSegHead (state_dict + K1 + in_dim) so it reloads without retraining
+    (tiny, ~1.5M params). Returns the path written."""
+    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": head.state_dict(), "K1": K1, "in_dim": head.proj.in_channels}, p)
+    return p
+
+
+def load_head_ckpt(path, device="cpu"):
+    """Rebuild a ConvSegHead from a checkpoint saved by save_head_ckpt — no retraining."""
+    c = torch.load(path, map_location=device)
+    head = ConvSegHead(in_dim=c["in_dim"], n_classes=c["K1"])
+    head.load_state_dict(c["state_dict"])
+    return head.to(device)
+
+
+def save_unet_ckpt(model, path, K1):
+    """Persist a trained UNet (our fine-tuned state_dict + K1). The base Mega Model arch is NOT
+    stored — it's rebuilt from the smp config on load — so this stays small-ish. Returns the path."""
+    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": model.state_dict(), "K1": K1}, p)
+    return p
+
+
+def load_unet_ckpt(model_config, path, device="cpu"):
+    """Rebuild the UNet from `model_config` (arch + base weights, cached after first download) and
+    load our trained state_dict over it — NO retraining. Mirrors train_unet's model setup (fresh
+    head + Identity activation for logits) so the state_dict keys line up."""
+    from dotenv import load_dotenv
+    from tytonai_utils.model import (download_model_weights_from_config,
+                                     load_model_with_fresh_head_from_config)
+    load_dotenv(".env", override=True)                          # AWS creds for the (cached) base weights
+    c = torch.load(path, map_location=device)
+    wpath = download_model_weights_from_config(model_config, "model_weight/unet")
+    model = load_model_with_fresh_head_from_config(model_config, wpath, num_classes=c["K1"],
+                                                   freeze_encoder=False)
+    if hasattr(model, "segmentation_head"):                     # CE logits: drop config activation (as in train_unet)
+        model.segmentation_head[-1] = nn.Identity()
+    model.load_state_dict(c["state_dict"])
+    return model.to(device)
 
 
 # ── shared setup (same tiles, features, targets and area split for EVERY model) ─────

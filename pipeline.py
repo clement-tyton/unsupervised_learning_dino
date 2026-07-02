@@ -109,10 +109,13 @@ def report_method(tiles_dir, dst, n_examples=2):
 
 
 def report_features(weights, ckpt, tiles, all_tiles, dst, device):
-    """Section 1 — PCA-RGB feature maps: a 6-tile grid + the whole-site mosaic."""
-    from src.visualisation.posttraining import compare_feature_mosaic, compare_features_grid
+    """Section 1 — PCA-RGB feature maps: a 6-tile grid + the whole-site mosaic, plus the
+    scale-invariant patch-differentiation bar (the honest 'expressiveness' number)."""
+    from src.visualisation.posttraining import (compare_feature_mosaic, compare_features_grid,
+                                                mean_cosine_bar)
     compare_features_grid(weights, ckpt, tiles[:6], device=device, out_png=dst / "pca_grid.png")
     compare_feature_mosaic(weights, ckpt, all_tiles, device=device, out_png=dst / "feature_mosaic.png")
+    mean_cosine_bar(weights, ckpt, all_tiles, device=device, out_png=dst / "patch_cosine_bar.png")
     return dst
 
 

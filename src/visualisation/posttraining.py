@@ -249,7 +249,8 @@ def _mosaic_png(maps, tiles, title, out_png, figsize=(12, 12), dpi=200):
 
 
 def compare_feature_mosaic(weights, ckpt, tiles, device="cpu", img_size=224,
-                           out_png=None, seed=0, dpi=200, align=True, cache_root=CACHE_ROOT):
+                           out_png=None, seed=0, dpi=200, align=True, normalize=True,
+                           cache_root=CACHE_ROOT):
     """Whole-site feature mosaic: every tile drawn as its PCA-RGB patch-feature map at
     its geo position (like overview.png, but features instead of imagery).
 
@@ -257,23 +258,69 @@ def compare_feature_mosaic(weights, ckpt, tiles, device="cpu", img_size=224,
     out_png='..._mosaic.png' you get '..._mosaic_pretrained.png' and '..._finetuned.png'.
     align=True (default): the finetuned PCA color axes are Procrustes-aligned to the
     pretrained ones (same patches), so R/G/B mean the same thing in both maps -> you
-    can compare them directly. Returns (pretrained_path, finetuned_path).
+    can compare them directly.
+    normalize=True (default): L2-normalize each patch feature BEFORE PCA, so the maps
+    reflect DIRECTION (structure) only — NOT feature magnitude. Finetuning inflates the
+    raw norm ~2-3x (an unconstrained side-effect, see pca_explosion), and with the shared
+    color range that magnitude alone makes the finetuned map look 'vivid' and the
+    pretrained 'faded' — a scale artifact, not more information. Normalizing removes it so
+    a genuine structure difference (if any) is what shows. Returns (pretrained_path, finetuned_path).
     """
     (fpre, _), (fft, _), g = pre_ft_features(weights, ckpt, tiles, device, img_size, cache_root)
+    # Scale-invariant expressiveness readout: mean pairwise patch cosine (lower = patches more
+    # differentiated from one another). Shown per panel so a REAL structure gain stays legible even
+    # after the magnitude 'vividness' is normalized away — cosine ignores magnitude, so it's honest.
+    cos_pre = _mean_pairwise_cos(fpre.reshape(-1, fpre.shape[-1]), seed=seed)
+    cos_ft = _mean_pairwise_cos(fft.reshape(-1, fft.shape[-1]), seed=seed)
+    if normalize:                                                        # DIRECTION only — kill the magnitude artifact
+        fpre = F.normalize(fpre.float(), dim=-1)
+        fft = F.normalize(fft.float(), dim=-1)
     if align:                                                            # shared color axes
         maps_pre, maps_ft = _aligned_pca_maps(fpre, fft, g, seed)
     else:                                                                # independent per map
         maps_pre, maps_ft = _global_pca_maps(fpre, g, seed), _global_pca_maps(fft, g, seed)
     del fpre, fft
 
+    tag = " · L2-normalized (structure, not magnitude)" if normalize else " · raw (magnitude affects color)"
     out_pre = out_ft = None
     if out_png:
         p = Path(out_png)
         out_pre = p.with_name(f"{p.stem}_pretrained{p.suffix}")
         out_ft = p.with_name(f"{p.stem}_finetuned{p.suffix}")
-    _mosaic_png(maps_pre, tiles, "pretrained (SAT)", out_pre, dpi=dpi)
-    _mosaic_png(maps_ft, tiles, "finetuned", out_ft, dpi=dpi)
+    _mosaic_png(maps_pre, tiles, f"pretrained (SAT){tag}\nmean patch-cos {cos_pre:.2f}", out_pre, dpi=dpi)
+    _mosaic_png(maps_ft, tiles, f"finetuned{tag}\nmean patch-cos {cos_ft:.2f} (lower = more differentiated)",
+                out_ft, dpi=dpi)
+    print(f"mosaic expressiveness — mean pairwise patch cosine: pretrained {cos_pre:.3f} -> finetuned {cos_ft:.3f} "
+          f"(lower = patches more differentiated)")
     return out_pre, out_ft
+
+
+def mean_cosine_bar(weights, ckpt, tiles, device="cpu", img_size=224, out_png=None, seed=0,
+                    cache_root=CACHE_ROOT):
+    """Bar chart of the mean pairwise patch cosine, pretrained vs finetuned — the honest,
+    magnitude-free 'expressiveness' number behind the mosaic. LOWER = patches more differentiated
+    from one another (finetuning drives this down). Cosine ignores magnitude, so this is exactly the
+    part of the PCA-RGB 'vividness' that is REAL structure, not the ~2.8x norm-inflation artifact.
+    Returns (cos_pre, cos_ft)."""
+    (fpre, _), (fft, _), _ = pre_ft_features(weights, ckpt, tiles, device, img_size, cache_root)
+    cp = _mean_pairwise_cos(fpre.reshape(-1, fpre.shape[-1]), seed=seed)
+    cf = _mean_pairwise_cos(fft.reshape(-1, fft.shape[-1]), seed=seed)
+    fig, ax = plt.subplots(figsize=(5, 4.6))
+    bars = ax.bar(["pretrained\n(SAT)", "finetuned"], [cp, cf], color=["#7fb0d3", "#e4796a"], width=0.6)
+    for b, v in zip(bars, [cp, cf]):
+        ax.text(b.get_x() + b.get_width() / 2, v, f"{v:.3f}", ha="center", va="bottom", fontsize=12)
+    drop = (cp - cf) / cp * 100 if cp else 0.0
+    ax.set_ylabel("mean pairwise patch cosine")
+    ax.set_ylim(0, max(cp, cf) * 1.25)
+    ax.set_title(f"patch differentiation — LOWER = more expressive\n"
+                 f"finetuning: {cp:.2f} -> {cf:.2f}  ({drop:.0f}% lower) · scale-invariant, no magnitude artifact",
+                 fontsize=10)
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    if out_png:
+        fig.savefig(out_png, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return cp, cf
 
 
 # ── patch-cluster exemplars ───────────────────────────────────────────────────────
@@ -339,6 +386,20 @@ def _patch_cosine(fpre, fft):
     return sim.reshape(fpre.shape[0], g, g).numpy()
 
 
+def _rotation_align(fpre, fft, sample=40000, seed=0):
+    """Apply the best GLOBAL orthogonal rotation R (Procrustes, ft->pre) to every finetuned patch.
+    Removing this shared rotation isolates the RESIDUAL per-patch change: a full-cloud rotation
+    lowers every self-cosine cos(pre_i, ft_i) without touching the relative geometry / separability
+    (it's rotation-invariant), so the raw per-patch cosine OVERSTATES the change. R is fit on a
+    subsample then applied to all. Returns ft rotated, same shape."""
+    from scipy.linalg import orthogonal_procrustes
+    P = fpre.reshape(-1, fpre.shape[-1]).float()
+    Ft = fft.reshape(-1, fft.shape[-1]).float()
+    idx = np.random.default_rng(seed).choice(len(P), min(sample, len(P)), replace=False)
+    R, _ = orthogonal_procrustes(Ft[idx].numpy(), P[idx].numpy())         # R: ft @ R ≈ pre
+    return (Ft @ torch.from_numpy(R)).reshape(fft.shape)
+
+
 def _cosine_mosaic_png(sim_maps, tiles, vmin, vmax, out_png,
                        figsize=(12, 12), dpi=200, cmap="magma"):
     """Whole-site heatmap of the per-patch cosine change at each tile's geo position."""
@@ -363,21 +424,35 @@ def _cosine_mosaic_png(sim_maps, tiles, vmin, vmax, out_png,
 
 
 def compare_patch_cosine(weights, ckpt, tiles, device="cpu", img_size=224,
-                         out_png=None, seed=0, dpi=200, cache_root=CACHE_ROOT):
+                         out_png=None, seed=0, dpi=200, align_rotation=True, cache_root=CACHE_ROOT):
     """WHERE did finetuning change the features? For every patch, the cosine similarity
     between its pretrained and finetuned embedding (same position, same input image).
+
+    align_rotation=True (default): first remove the best GLOBAL rotation (Procrustes) between the
+    two feature clouds, so the heatmap/histogram show the RESIDUAL per-patch change — NOT a trivial
+    full-cloud rotation, which would lower every self-cosine without changing the relative geometry
+    (separability is rotation-invariant). Set False to see the raw cosine (rotation included).
 
     Saves a whole-site geo HEATMAP (dark = big change) and a histogram of all per-patch
     similarities, and prints the mean. Returns (mosaic_path, hist_path, mean_sim).
     """
     (fpre, _), (fft, _), g = pre_ft_features(weights, ckpt, tiles, device, img_size, cache_root)
+    raw_mean = float(_patch_cosine(fpre, fft).mean())    # before de-rotation (for the print delta)
+    if align_rotation:                                   # isolate residual change, drop global rotation
+        fft = _rotation_align(fpre, fft, seed=seed)
     sim = _patch_cosine(fpre, fft)                       # (T, g, g)
 
     flat = sim.reshape(-1)
     mean_sim = float(flat.mean())
     vmin = float(np.percentile(flat, 1))                 # robust low end -> contrast
-    print(f"mean per-patch cosine(pretrained, finetuned) = {mean_sim:.4f}  "
-          f"(1st pct {vmin:.3f}); lower = more changed by finetuning")
+    tag = " · residual (global rotation removed)" if align_rotation else " · raw (rotation included)"
+    if align_rotation:
+        print(f"mean per-patch cosine(pretrained, finetuned) = {mean_sim:.4f} residual "
+              f"(raw {raw_mean:.4f} -> {mean_sim:.4f} once the global rotation is removed; "
+              f"the gap was a trivial rotation, not real change)")
+    else:
+        print(f"mean per-patch cosine(pretrained, finetuned) = {mean_sim:.4f}  "
+              f"(1st pct {vmin:.3f}); lower = more changed by finetuning")
 
     out_mosaic = out_hist = None
     if out_png:
@@ -391,7 +466,7 @@ def compare_patch_cosine(weights, ckpt, tiles, device="cpu", img_size=224,
     ax.axvline(mean_sim, color="#e41a1c", lw=2, label=f"mean = {mean_sim:.3f}")
     ax.set_xlabel("cosine(pretrained patch, finetuned patch)")
     ax.set_ylabel("patch count")
-    ax.set_title(f"how much finetuning moved each patch ({len(tiles)} tiles)", fontsize=11)
+    ax.set_title(f"how much finetuning moved each patch ({len(tiles)} tiles){tag}", fontsize=11)
     ax.legend()
     fig.tight_layout()
     if out_hist:
@@ -479,17 +554,24 @@ def _pick_tiles(counts, k_tiles, randomize, pool_frac, seed):
 
 def changed_patch_story(weights, ckpt, tiles, q=0.05, which="changed", k_tiles=6, randomize=False,
                         pool_frac=0.4, device="cpu", img_size=224, out_png=None, seed=0,
-                        cache_root=CACHE_ROOT):
+                        normalize=True, cache_root=CACHE_ROOT):
     """Pick the patches that moved most (which='changed', lowest pre-vs-ft cosine) or least
     (which='stable', highest cosine), and show (1) the tiles richest in them, with PCA-RGB
     feature colour before/after, and (2) how they migrate in the shared PCA feature space.
 
     q = the quantile (0.05 -> the 5% most/least changed patches). randomize=True samples
     the shown tiles from the top `pool_frac` of qualifying tiles (vary seed for new draws).
+    normalize=True (default): L2-normalize features before the PCA-RGB colours AND the migration
+    scatter, so both reflect DIRECTION, not the ~2.8x norm inflation (else the finetuned colours
+    look 'vivid' and every arrow points outward by magnitude alone — a scale artifact). The patch
+    SELECTION is unaffected either way (it's already cosine-based, scale-invariant).
     Saves two PNGs (_montage, _migration). Returns (montage_path, migration_path, threshold).
     """
     (fpre, _), (fft, _), g = pre_ft_features(weights, ckpt, tiles, device, img_size, cache_root)
-    sim = _patch_cosine(fpre, fft)                          # (T, g, g)
+    if normalize:                                          # colours + migration reflect DIRECTION, not the norm drift
+        fpre = F.normalize(fpre.float(), dim=-1)
+        fft = F.normalize(fft.float(), dim=-1)
+    sim = _patch_cosine(fpre, fft)                          # (T, g, g)  [cosine: scale-invariant, selection unchanged]
     if which == "changed":
         thr = float(np.quantile(sim, q)); mask = sim <= thr; noun = "changed"
     else:

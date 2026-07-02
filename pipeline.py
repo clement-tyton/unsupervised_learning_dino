@@ -247,6 +247,64 @@ def run_unet_seg(paths, device="cpu", unet_epochs=5, unet_batch=16, mlflow=True)
     return res
 
 
+# ── 5c) whole-site classification maps (finetuned-DINO head vs UNet, colored geo-rasters) ──
+def _site_tiles(paths, n=10**9):
+    """Every (nearly) full imagery tile across ALL area subdirs of the site — the whole-site
+    inference set for the classification maps (edge/black tiles skipped, like the feature mosaic)."""
+    from src.visualisation.common import pick_full_tiles
+    tiles = []
+    for area_dir in sorted(p for p in paths["rgb"].iterdir() if p.is_dir()):
+        tiles += pick_full_tiles(area_dir, n=n)
+    return tiles
+
+
+def run_classification_maps(paths, ckpt, weights=WEIGHTS, device="cpu", dino_res=None,
+                            unet_res=None, epochs=50, unet_epochs=10, img_size=512):
+    """Whole-site classification maps: run the FINETUNED-DINO seg head and the UNet baseline over
+    EVERY site tile and write colored geo-rasters (report/06_classification_maps/: map_dino_finetuned,
+    map_unet, map_compare, legend). REUSES the models already trained by run_dino_seg_heads /
+    run_unet_seg when their result dicts are passed as `dino_res`/`unet_res`; trains only what's
+    missing (the DINO head is cheap; the UNet is best-effort and skipped if it can't be sourced).
+    Needs aligned masks (for the class space) + the .tif tiles."""
+    from src.evaluation.segmentation_compare import (baseline_unet, class_mapping, finetuned_head,
+                                                     predict_dino_site, predict_unet_site)
+    from src.visualisation.classification import classification_maps
+    if not _has_aligned_tiles(paths):
+        print("[pipeline] no aligned tiles — run align_annotations first; skipping classification maps")
+        return None
+    _, _, names = class_mapping(paths["masks"])                # shared contiguous class space (0=ignore)
+
+    # DINO finetuned head — reuse 5a's if handed in, else train just this one (cheap, cached feats)
+    head = dino_res.get("dino_finetuned", (None,))[0] if dino_res else None
+    if head is None:
+        print("[maps] no DINO head passed — training the finetuned head")
+        head, names = finetuned_head(weights, ckpt, paths["rgb"], paths["masks"],
+                                     device=device, img_size=img_size, epochs=epochs)
+
+    # UNet — reuse 5b's if handed in, else train it (best-effort; needs unet_config + S3 weights)
+    unet = unet_res.get("unet", (None,))[0] if unet_res else None
+    if unet is None and paths["model_config"].exists():
+        try:
+            print("[maps] no UNet passed — training the baseline UNet")
+            unet = baseline_unet(paths["rgb"], paths["masks"], paths["model_config"],
+                                 device=device, img_size=img_size, unet_epochs=unet_epochs)
+        except Exception as e:                                 # unavailable weights/config -> skip UNet panel
+            print(f"[maps] UNet unavailable ({type(e).__name__}: {e}) — DINO map only")
+
+    tiles = _site_tiles(paths)
+    if not tiles:
+        print("[maps] no full tiles found — skipping classification maps")
+        return None
+    print(f"[maps] {paths['name']}: classifying {len(tiles)} site tiles on {device}")
+    dino_preds = predict_dino_site(head, weights, ckpt, tiles, device, img_size) if head else None
+    unet_preds = predict_unet_site(unet, paths["model_config"], tiles, device, img_size) if unet else None
+
+    dst = _make_sections(paths["out"] / "report", ["06_classification_maps"])["06_classification_maps"]
+    out = classification_maps(dino_preds, unet_preds, tiles, names, dst)
+    print(f"[maps] {paths['name']}: {len([k for k in out if k != 'legend'])} maps -> {dst}")
+    return out
+
+
 # ── all post-training analysis for one site / many sites (NO download, NO train) ──────
 def run_site_analysis(paths, ckpt, device="cuda:1", epochs=50, unet_epochs=10, mlflow=True):
     """Full per-site flow EXCEPT the unsupervised finetuning: data prep (download imagery +
@@ -267,8 +325,10 @@ def run_site_analysis(paths, ckpt, device="cuda:1", epochs=50, unet_epochs=10, m
         align_annotations(paths)
     run_visual_analysis(paths, ckpt, device=device)            # 3) pretrained-vs-finetuned pictures
     run_evaluation(paths, ckpt, device=device)                 # 4) cluster / confusion / probe (needs masks)
-    run_dino_seg_heads(paths, ckpt, device=device, epochs=epochs, mlflow=mlflow)   # 5a) DINO seg heads
-    run_unet_seg(paths, device=device, unet_epochs=unet_epochs, mlflow=mlflow)     # 5b) UNet baseline
+    dino_res = run_dino_seg_heads(paths, ckpt, device=device, epochs=epochs, mlflow=mlflow)   # 5a) DINO seg heads
+    unet_res = run_unet_seg(paths, device=device, unet_epochs=unet_epochs, mlflow=mlflow)     # 5b) UNet baseline
+    run_classification_maps(paths, ckpt, device=device, dino_res=dino_res, unet_res=unet_res,  # 5c) whole-site maps
+                            epochs=epochs, unet_epochs=unet_epochs)
 
 
 def run_all_sites(site_dirs, device="cuda:1", epochs=50, unet_epochs=10, mlflow=True):
@@ -308,7 +368,7 @@ if __name__ == "__main__":
     # --- choose ONE site ---
     
     CONFIG = {
-        "site_dir": "input_site_data/EM2020_Jimblebar_Rail",
+        "site_dir": "input_site_data/monrovia",
         #"site_dir": "input_site_data/manned_bens_oasis_wet",
         #"site_dir": "input_site_data/monrovia",
         # 50 epochs, MLflow on (experiment 'dino_lora_finetune'), checkpoint every 10 epochs
@@ -340,15 +400,17 @@ if __name__ == "__main__":
     
     run_visual_analysis(paths, ckpt, device=CONFIG["device"])   # 3) pretrained-vs-finetuned pictures
     run_evaluation(paths, ckpt, device=CONFIG["device"])        # 4) cluster / confusion / probe on aligned tiles
-    run_dino_seg_heads(paths, ckpt, device="cuda:1", epochs=50)        # 5a) 2 DINO seg heads (cheap, cached -> MLflow)
-    run_unet_seg(paths, device="cuda:1", unet_epochs=10)               # 5b) prod-like UNet baseline (standalone -> MLflow)
+    dino_res = run_dino_seg_heads(paths, ckpt, device="cuda:1", epochs=50)   # 5a) 2 DINO seg heads (cheap, cached -> MLflow)
+    unet_res = run_unet_seg(paths, device="cuda:1", unet_epochs=10)          # 5b) prod-like UNet baseline (standalone -> MLflow)
+    run_classification_maps(paths, ckpt, device="cuda:1",                    # 5c) whole-site maps (DINO-ft vs UNet, colored rasters)
+                            dino_res=dino_res, unet_res=unet_res)
 
     # ── OR: relaunch the analysis for ALL sites at once, NO download / NO training ─────
     #  Uses each site's existing checkpoint. Sites without aligned masks (curepto, EM2020)
     #  run visual analysis only; the eval / DINO / UNet steps self-skip for them.
     SITES = [
-        #"input_site_data/curepto_chile",
-        "input_site_data/EM2020_Jimblebar_Rail",
+        # "input_site_data/curepto_chile",
+        # "input_site_data/EM2020_Jimblebar_Rail",
         "input_site_data/manned_bens_oasis_wet",
         "input_site_data/monrovia",
     ]

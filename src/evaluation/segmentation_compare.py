@@ -239,7 +239,8 @@ def seg_scores(cm, K1):
     gt = cm[1:, :].sum(1).astype(float)                         # TP+FN (all GT pixels per class)
     pr = cm[:, 1:].sum(0).astype(float)                         # TP+FP (all pixels predicted as class)
     denom = gt + pr
-    f1 = np.where(denom > 0, 2 * inter / denom, np.nan)
+    f1 = np.full(inter.shape, np.nan)                            # classes absent from val stay NaN
+    np.divide(2 * inter, denom, out=f1, where=denom > 0)         # divide only where denom>0 (no 0/0 warning)
     return f1, float(np.nanmean(f1)), (float(inter.sum() / gt.sum()) if gt.sum() else 0.0)
 
 
@@ -317,6 +318,67 @@ def eval_unet(model, imgs, targets, te_idx, K1, model_config, device="cpu", img_
         x = norm(image=_rgb_raw(imgs[idx], img_size))["image"][None].to(device)
         return model(x).argmax(1)[0].cpu().numpy()
     return _eval_seg(predict, te_idx, targets, K1)
+
+
+# ── whole-site inference: run a TRAINED model over EVERY tile (not just val) ─────────
+@torch.no_grad()
+def predict_dino_site(head, weights, ckpt, tiles, device="cpu", img_size=512, tta=True):
+    """Per-tile (out,out) predicted class-index maps from the trained FINETUNED ConvSegHead over an
+    arbitrary tile list (the whole site, not just the val split). Same prediction path as eval_head
+    (optional flip-TTA), on the finetuned cached features. Returns a list of (out,out) int arrays
+    aligned 1:1 with `tiles`, in the contiguous class space (0 = ignore, 1..K = class_mapping)."""
+    _, ft = _dino_features(weights, ckpt, tiles, device, img_size)   # finetuned feats (pre dropped)
+    head.eval()
+    preds = []
+    for i in range(len(tiles)):
+        x = ft[i:i + 1].to(device)
+        logits = _tta_logits(head, x) if tta else head(x)
+        preds.append(logits.argmax(1)[0].cpu().numpy())
+    return preds
+
+
+@torch.no_grad()
+def predict_unet_site(model, model_config, tiles, device="cpu", img_size=512):
+    """Per-tile (img_size,img_size) predicted class-index maps from the trained UNet over an arbitrary
+    tile list. SAME preprocessing as eval_unet (_rgb_raw + site-stat Normalize) so inference matches
+    training. Returns a list aligned 1:1 with `tiles`, in the contiguous class space."""
+    import albumentations as albu
+    from albumentations.pytorch import ToTensorV2
+    from tytonai_utils.model import read_model_config
+    cfg = read_model_config(model_config)["config"]
+    norm = albu.Compose([albu.Normalize(mean=cfg["train_mean"], std=cfg["train_std"],
+                                        max_pixel_value=1.0), ToTensorV2()])   # identical to eval_unet
+    model.eval()
+    preds = []
+    for t in tiles:
+        x = norm(image=_rgb_raw(t, img_size))["image"][None].to(device)
+        preds.append(model(x).argmax(1)[0].cpu().numpy())
+    return preds
+
+
+# ── single-model trainers (the maps step's retrain-if-absent path; no ablation ladder) ──
+def finetuned_head(weights, ckpt, rgb_root, masks_root, device="cpu", img_size=512,
+                   epochs=50, batch_size=4, test_frac=0.3, seed=0):
+    """Train JUST the finetuned-DINO ConvSegHead on the aligned split (no ablation ladder, no UNet).
+    For run_classification_maps when a trained head wasn't handed in. Returns (head, names)."""
+    d = _prepare_data(rgb_root, masks_root, img_size, test_frac, seed)
+    _, ft = _dino_features(weights, ckpt, d["imgs"], device, img_size)
+    cw = class_weights(d["targets"], d["tr_idx"], d["K1"])
+    head, _ = train_dino_head(ft, d["targets"], d["tr_idx"], d["K1"], device, epochs,
+                              batch_size=batch_size, class_weight=cw, seed=seed, aug=True)
+    return head, d["names"]
+
+
+def baseline_unet(rgb_root, masks_root, model_config, device="cpu", img_size=512,
+                  unet_epochs=5, unet_batch=16, test_frac=0.3, seed=0):
+    """Train JUST the UNet baseline on the aligned split (for run_classification_maps when a trained
+    UNet wasn't handed in). Raises if the S3 weights / 'epoch_file_key' are unavailable — the caller
+    decides whether to skip. Returns the trained model."""
+    d = _prepare_data(rgb_root, masks_root, img_size, test_frac, seed)
+    cw = class_weights(d["targets"], d["tr_idx"], d["K1"])
+    model, _ = train_unet(d["imgs"], d["targets"], d["tr_idx"], model_config, d["K1"], device,
+                          unet_epochs, batch_size=unet_batch, class_weight=cw, seed=seed)
+    return model
 
 
 # ── shared setup (same tiles, features, targets and area split for EVERY model) ─────
